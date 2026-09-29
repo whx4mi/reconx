@@ -2716,7 +2716,7 @@ def _safe_js_json(obj):
     """JSON seguro para embedding em <script> — escapa </ para evitar fechar a tag prematuramente."""
     raw = json.dumps(obj, ensure_ascii=False)
     # </script> dentro de JSON fecha o <script> no HTML; </ -> <\/ é JSON válido e seguro
-    raw = raw.replace('</', '<\/')
+    raw = raw.replace('</', '<' + chr(92) + '/')
     return raw
 
 @app.route('/')

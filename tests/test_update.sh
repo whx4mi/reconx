@@ -12,13 +12,15 @@ export TEST_SERVICE_STATE="$TEST_DIR/service-state"
 export TEST_SERVICE_LOG="$TEST_DIR/service-log"
 export TEST_FAIL_START=0 TEST_FAIL_DEPS=0
 [[ -n "$TEST_PYTHON_BIN" ]] || { echo 'Python necessário para os testes'; exit 1; }
-mkdir -p "$RECONX_ROOT/app/templates" "$RECONX_ROOT/results" "$RECONX_REPO_URL/templates"
+mkdir -p "$RECONX_ROOT/app/templates" "$RECONX_ROOT/results" "$RECONX_REPO_URL/templates" "$RECONX_REPO_URL/tests"
 printf 'old\n' > "$RECONX_ROOT/app/app.py"
 printf 'old template\n' > "$RECONX_ROOT/app/templates/index.html"
 printf 'scan preserved\n' > "$RECONX_ROOT/results/sentinel.txt"
 printf "print('new version')\n" > "$RECONX_REPO_URL/app.py"
 printf 'new template\n' > "$RECONX_REPO_URL/templates/index.html"
 cp "$PROJECT_DIR/update.sh" "$RECONX_REPO_URL/update.sh"
+cp "$PROJECT_DIR/tests/fixtures/update_test_probe.py" "$RECONX_REPO_URL/update_test_probe.py"
+cp "$PROJECT_DIR/tests/fixtures/test_update_cwd.py" "$RECONX_REPO_URL/tests/test_update_cwd.py"
 git -C "$RECONX_REPO_URL" init -q -b main
 git -C "$RECONX_REPO_URL" add .
 git -C "$RECONX_REPO_URL" -c user.name=UpdaterTest -c user.email=test@example.invalid commit -qm initial

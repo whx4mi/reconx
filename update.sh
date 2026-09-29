@@ -97,7 +97,9 @@ PY
 bash -n "$WORK_DIR/repo/update.sh"
 python3 -c 'import flask, flask_socketio' || die 'Instale as dependências Python usando install.sh'
 if [[ -d "$WORK_DIR/repo/tests" ]]; then
-    python3 -B -m unittest discover -s "$WORK_DIR/repo/tests" -v
+    # unittest imports test modules from the cloned tree. Keep its root on
+    # sys.path and make relative fixture paths resolve to the new revision.
+    ( cd "$WORK_DIR/repo" && python3 -B -m unittest discover -s tests -v )
 fi
 
 # O instalador padrão usa primeiro plano. Não troca arquivos de um scan ativo.
