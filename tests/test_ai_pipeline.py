@@ -62,12 +62,12 @@ class AiPipelineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ai.validate_decision(d, {('ai_headers', 't0')})
 
-    def test_headers_auto_then_active_approval(self):
+    def test_every_action_needs_approval(self):
         result = self.run_scan([decision(), decision('ai_ports'), decision('', '', 'stop')])
         self.assertEqual(result['status'], 'stopped')
         self.assertEqual(self.execute.call_count, 2)
-        self.approve.assert_called_once()
-        self.assertEqual(self.approve.call_args.args[0]['target'], BASE)
+        self.assertEqual(self.approve.call_count, 2)
+        self.assertEqual(self.approve.call_args_list[0].args[0]['target'], BASE)
         self.assertIn('Server: lab', self.decide.call_args_list[1].args[0]['observations'][0]['output'])
 
     def test_rejection_never_executes_or_reoffers_pair(self):
@@ -114,6 +114,31 @@ class AiPipelineTests(unittest.TestCase):
         self.assertIn('password', encoded)
         self.assertEqual(result['status'], 'stopped')
 
+    def test_manual_step_requires_operator_observation_and_retriages_it(self):
+        result = self.run_scan([decision('ai_manual'), decision('', '', 'stop')],
+                               approve='Identifiquei um formulário sem CSRF. Cookie: secret')
+        self.execute.assert_not_called()
+        self.assertEqual(result['status'], 'stopped')
+        obs = self.decide.call_args_list[1].args[0]['observations'][0]
+        self.assertEqual(obs['tool'], 'ai_manual')
+        self.assertIn('formulário sem CSRF', obs['output'])
+        self.assertNotIn('secret', obs['output'])
+        self.assertEqual(result['decisions'][0]['authorization'], 'operator_approved')
+
+    def test_manual_without_observation_does_not_advance(self):
+        result = self.run_scan([decision('ai_manual'), decision('', '', 'stop')], approve=True)
+        self.execute.assert_not_called()
+        self.assertEqual(result['decisions'][0]['outcome'], 'rejected_or_expired')
+        self.assertEqual(result['observations'], [])
+
+    def test_distinct_manual_phases_can_recur_within_step_limit(self):
+        notes = iter(['Autenticação: sessão expira', 'Autorização: perfil limitado'])
+        result = ai.run(self.config(max_steps=3),
+                        MagicMock(side_effect=[decision('ai_manual'), decision('ai_manual'), decision('', '', 'stop')]),
+                        MagicMock(), lambda action: next(notes), MagicMock(), MagicMock(), lambda: False)
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual([x['tool'] for x in result['observations']], ['ai_manual', 'ai_manual'])
+
     def test_redaction(self):
         text = ai.redact('Set-Cookie: session=ABC\nAuthorization: Bearer KEY\npassword=PWD\nhttps://lab.test/?token=XYZ')
         for secret in ('ABC', 'KEY', 'PWD', 'XYZ'):
@@ -130,6 +155,17 @@ class AiPipelineTests(unittest.TestCase):
         self.assertFalse(ai.Approval('owner', {}, timeout=0).resolve('owner', gate.id, True))
         self.assertFalse(ai.Approval('owner', {}).wait(lambda: True))
 
+    def test_manual_gate_requires_note_and_nonmanual_gate_rejects_note(self):
+        manual = ai.Approval('owner', {'tool': 'ai_manual'})
+        self.assertFalse(manual.resolve('owner', manual.id, True))
+        self.assertFalse(manual.resolve('owner', manual.id, True, ''))
+        self.assertTrue(manual.resolve('owner', manual.id, True, 'Revisão visual concluída'))
+        self.assertEqual(manual.observation, 'Revisão visual concluída')
+        self.assertFalse(manual.resolve('owner', manual.id, True, 'segunda'))
+        tool = ai.Approval('owner', {'tool': 'ai_headers'})
+        self.assertFalse(tool.resolve('owner', tool.id, True, 'texto indevido'))
+        self.assertTrue(tool.resolve('owner', tool.id, True))
+
     def test_concurrent_replies_only_one_consumed(self):
         gate = ai.Approval('owner', {})
         results = []
@@ -145,28 +181,29 @@ class AiPipelineTests(unittest.TestCase):
             self.assertNotIn('SECRETKEY', ' '.join(cmd))
             self.assertEqual(cmd[:2], ['curl', '-q'])
             data = json.loads(Path(cmd[cmd.index('--data-binary') + 1][1:]).read_text())
-            self.assertTrue(data['response_format']['json_schema']['strict'])
-            Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({'choices': [
-                {'finish_reason': 'stop', 'message': {'content': json.dumps(decision())}}]}))
+            self.assertEqual(data['generationConfig']['responseFormat']['text']['mimeType'], 'application/json')
+            self.assertEqual(data['generationConfig']['responseFormat']['text']['schema']['properties']['tool']['enum'][1], 'ai_headers')
+            self.assertIn('x-goog-api-key: SECRETKEY', Path(cmd[cmd.index('--header') + 1][1:]).read_text())
+            Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({'candidates': [
+                {'finishReason': 'STOP', 'content': {'parts': [{'text': json.dumps(decision())}]}}]}))
             return subprocess.CompletedProcess(cmd, 0, '200', '')
-        env = {'RECONX_AI_KEY': 'SECRETKEY', 'RECONX_AI_MODEL': 'model'}
+        env = {'GEMINI_API_KEY': 'SECRETKEY', 'GEMINI_MODEL': 'gemini-model'}
         with patch.object(subprocess, 'run', side_effect=transport):
             self.assertEqual(ai.request_decision({}, environ=env), decision())
         with self.assertRaises(ValueError):
             ai.request_decision({}, environ={})
 
-    def test_api_refusal_and_plaintext_endpoint_blocked(self):
-        env = {'RECONX_AI_KEY': 'key', 'RECONX_AI_MODEL': 'model'}
+    def test_api_refusal_and_invalid_model_blocked(self):
+        env = {'GEMINI_API_KEY': 'key', 'GEMINI_MODEL': 'gemini-model'}
         def transport(cmd, **kw):
-            Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({'choices': [
-                {'finish_reason': 'stop', 'message': {'content': '{}', 'refusal': 'no'}}]}))
+            Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({'candidates': []}))
             return subprocess.CompletedProcess(cmd, 0, '200', '')
         with patch.object(subprocess, 'run', side_effect=transport):
             with self.assertRaises(ValueError):
                 ai.request_decision({}, environ=env)
         with patch.object(subprocess, 'run') as launch:
             with self.assertRaises(ValueError):
-                ai.request_decision({}, environ={**env, 'RECONX_AI_URL': 'http://remote.test/'})
+                ai.request_decision({}, environ={**env, 'GEMINI_MODEL': 'http://remote.test/'})
             launch.assert_not_called()
 
     def test_socket_approval_and_old_checkpoint_cannot_bypass_gate(self):
@@ -208,7 +245,7 @@ class AiPipelineTests(unittest.TestCase):
             def socket_emit(event, data, room):
                 self.assertEqual(room, 'owner')
                 if event == 'ai_approval_required':
-                    self.assertEqual(data['tool'], 'ai_ports')
+                    self.assertIn(data['tool'], ('ai_headers', 'ai_ports'))
                     self.assertTrue(scan['ai_approval'].resolve('owner', data['proposal_id'], True))
             ns['socketio'] = SimpleNamespace(emit=MagicMock(side_effect=socket_emit))
             def execute(scan_id, tool, target, sid, outcome):

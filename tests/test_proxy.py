@@ -9,6 +9,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import sqlite3
 import socket
 import subprocess
 import threading
@@ -22,7 +23,7 @@ def load_helpers():
     tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))
     functions = {'check_proxy_alive', '_proxy_url_if_alive', '_tool_proxy_url',
                  'proxy_status', 'inject_proxy', 'proxy_env', 'to_host', 'to_domain',
-                 'to_url', 'to_http_url', 'build_cmd', 'run_tool_sequential',
+                 'to_url', 'to_http_url', 'build_cmd', '_record_host_attempt', 'run_tool_sequential',
                  'run_verification', 'api_retest'}
     nodes = []
     for node in tree.body:
@@ -33,7 +34,7 @@ def load_helpers():
                 isinstance(t, ast.Name) and t.id in {'TOOLS', 'PROXY_PROFILES', 'USER_AGENTS'}
                 for t in node.targets):
             nodes.append(node)
-    ns = dict(Path=Path, re=re, socket=socket, urlsplit=urlsplit, random=random,
+    ns = dict(Path=Path, re=re, socket=socket, urlsplit=urlsplit, random=random, sqlite3=sqlite3,
               subprocess=subprocess, shutil=shutil, threading=threading, time=time,
               WL_COMMON=None, WL_SMALL=None, WL_DNS=None, SCREENS_DIR=Path('/tmp/screens'),
               DEFAULT_TOOL_TIMEOUT=10, VERIFY_TIMEOUT=10, VERIFY_MAX_OUTPUT=4000,
@@ -46,6 +47,7 @@ def load_helpers():
               strip_ansi=lambda s: s, _is_stream_noise=lambda s: False,
               _save_tool_output=MagicMock(), _scan_output_dir=lambda s: Path('/tmp'),
               parse_output=lambda *a: ([], []), persist_and_emit_findings=MagicMock(),
+              host_store=MagicMock(),
               jsonify=lambda x: x)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), 'app.py', 'exec'), ns)
     return ns

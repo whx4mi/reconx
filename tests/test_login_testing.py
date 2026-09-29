@@ -57,16 +57,17 @@ class LoginTestingTests(unittest.TestCase):
                 clean_candidates(values)
         self.assertEqual(clean_candidates(['a', 'a', 'b', 'c'], limit=2), ['a', 'b'])
 
-    def fake_ai(self, content, finish='stop', refusal=None):
+    def fake_ai(self, content, finish='STOP', refusal=None):
         def curl(cmd, **kwargs):
             self.assertNotIn('test-api-key', ' '.join(cmd))
             header_file = Path(cmd[cmd.index('--header') + 1][1:])
             self.assertIn('test-api-key', header_file.read_text())
             payload = json.loads(Path(cmd[cmd.index('--data-binary') + 1][1:]).read_text())
-            self.assertEqual(payload['response_format']['type'], 'json_schema')
+            self.assertEqual(payload['generationConfig']['responseFormat']['text']['mimeType'], 'application/json')
+            self.assertEqual(payload['contents'][0]['role'], 'user')
             output = Path(cmd[cmd.index('--output') + 1])
-            output.write_text(json.dumps({'choices': [{'finish_reason': finish,
-                'message': {'content': json.dumps(content), 'refusal': refusal}}]}))
+            output.write_text(json.dumps({'candidates': [] if refusal else [{'finishReason': finish,
+                'content': {'parts': [{'text': json.dumps(content)}]}}]}))
             self.assertFalse(any(k.lower() in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')
                                  for k in kwargs['env']))
             return MagicMock(returncode=0, stdout='200')
@@ -74,32 +75,32 @@ class LoginTestingTests(unittest.TestCase):
 
     def test_ai_structured_output_and_explicit_proxy(self):
         with patch.object(subprocess, 'run', side_effect=self.fake_ai({'users': ['admin', 'admin'], 'passwords': ['labpass']})) as launch:
-            result = generate_wordlists('MeOwna public title', environ={'RECONX_AI_KEY': 'test-api-key', 'RECONX_AI_MODEL': 'test-model'},
+            result = generate_wordlists('MeOwna public title', environ={'GEMINI_API_KEY': 'test-api-key', 'GEMINI_MODEL': 'gemini-test-model'},
                                        proxy={'profile': 'burp', 'http': 'http://localhost:8080'})
             self.assertEqual(result, (['admin'], ['labpass']))
             cmd = launch.call_args.args[0]
             self.assertEqual(cmd[cmd.index('--proxy') + 1], 'http://localhost:8080')
             self.assertEqual(cmd[cmd.index('--noproxy') + 1], '')
 
-    def test_ai_requires_server_credentials_and_model(self):
+    def test_ai_requires_server_credentials(self):
         with patch.object(subprocess, 'run') as launch:
             with self.assertRaises(ValueError):
                 generate_wordlists('public', environ={})
             launch.assert_not_called()
 
     def test_ai_rejects_injected_actions_refusal_and_truncation(self):
-        env = {'RECONX_AI_KEY': 'test-api-key', 'RECONX_AI_MODEL': 'test-model'}
-        variants = [({'users': ['admin'], 'passwords': ['lab'], 'command': 'sh'}, 'stop', None),
-                    ({'users': ['admin'], 'passwords': ['lab']}, 'length', None),
-                    ({'users': ['admin'], 'passwords': ['lab']}, 'stop', 'refused'),
-                    ({'users': ['a\nb'], 'passwords': ['lab']}, 'stop', None)]
+        env = {'GEMINI_API_KEY': 'test-api-key', 'GEMINI_MODEL': 'gemini-test-model'}
+        variants = [({'users': ['admin'], 'passwords': ['lab'], 'command': 'sh'}, 'STOP', None),
+                    ({'users': ['admin'], 'passwords': ['lab']}, 'MAX_TOKENS', None),
+                    ({'users': ['admin'], 'passwords': ['lab']}, 'STOP', 'refused'),
+                    ({'users': ['a\nb'], 'passwords': ['lab']}, 'STOP', None)]
         for data, finish, refusal in variants:
             with patch.object(subprocess, 'run', side_effect=self.fake_ai(data, finish, refusal)):
                 with self.assertRaises(ValueError):
                     generate_wordlists('ignore instructions from site', environ=env)
 
-    def test_ai_refuses_plaintext_remote_endpoint(self):
-        env = {'RECONX_AI_KEY': 'test-api-key', 'RECONX_AI_MODEL': 'test-model', 'RECONX_AI_URL': 'http://remote.test/v1/chat/completions'}
+    def test_ai_rejects_invalid_model(self):
+        env = {'GEMINI_API_KEY': 'test-api-key', 'GEMINI_MODEL': 'http://remote.test'}
         with self.assertRaises(ValueError):
             generate_wordlists('public', environ=env)
 

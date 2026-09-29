@@ -29,6 +29,7 @@ import urllib.request
 from web_intelligence import discover, plan_tests, parse_page, form_request, scoped_url
 from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
 import ai_pipeline
+from host_profiles import Store as HostStore, canonical_host
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('RECONX_SECRET') or secrets.token_hex(16)
@@ -162,6 +163,8 @@ def db_summary(scan_id):
     return {'severity': sev, 'assets': atypes, 'total': total}
 
 db_init()
+host_store = HostStore(DB_PATH)
+host_store.init()
 
 EXEC_ENV = os.environ.copy()
 EXEC_ENV['PATH'] = '/root/go/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:' + os.environ.get('PATH','')
@@ -1301,9 +1304,35 @@ TOOLS.update({
         'desc': 'Protocolos e ciphers TLS', 'cmd': ['testssl.sh', '--quiet', '--color', '0',
             '--protocols', '--server-defaults', '{url}'],
         'input': 'url', 'output': 'raw', 'binary': 'testssl.sh', 'tags': ['active'], 'timeout': 120, 'proxy_support': True},
+    'ai_fingerprint': {'label': 'IA: WhatWeb', 'phase': 'recon', 'category': 'web',
+        'desc': 'Fingerprint de tecnologia', 'cmd': ['whatweb', '--color=never', '--no-errors', '{url}'],
+        'input': 'url', 'output': 'raw', 'binary': 'whatweb', 'tags': ['active'], 'timeout': 45, 'proxy_support': True},
 })
 
 PIPELINES = {
+    'host_recon': {
+        'label': 'Recon inicial por host', 'icon': '◎', 'color': '#8be9fd',
+        'profile_segmented': True,
+        'desc': 'Inventário inicial de portas e serviços; resultados persistidos no perfil do host',
+        'stages': [{'id': 'inventory', 'name': 'Inventário inicial', 'phase': 'recon',
+                    'tools': ['nmap_quick', 'naabu']}],
+    },
+    'web_recon': {
+        'label': 'Recon web segmentado', 'icon': '⌁', 'color': '#00cfff',
+        'profile_segmented': True,
+        'desc': 'Fingerprint, rotas e parâmetros depois de identificar superfície HTTP',
+        'stages': [{'id': 'fingerprint', 'name': 'Fingerprint HTTP', 'phase': 'recon',
+                    'tools': ['httpx', 'whatweb', 'curl_headers']},
+                   {'id': 'routes', 'name': 'Rotas e parâmetros', 'phase': 'recon',
+                    'tools': ['katana', 'arjun']}],
+    },
+    'api_recon': {
+        'label': 'Recon API segmentado', 'icon': '◇', 'color': '#ff6e6e',
+        'profile_segmented': True,
+        'desc': 'Inventário de endpoints e parâmetros após observar uma API',
+        'stages': [{'id': 'api_inventory', 'name': 'Endpoints de API', 'phase': 'recon',
+                    'tools': ['katana', 'arjun', 'gau']}],
+    },
     'ai_guided': {
         'label': 'Triagem orientada por IA', 'icon': '◇', 'color': '#bd93f9',
         'desc': 'BlackBox / WhiteBox: decisões auditáveis e aprovação por ação ativa',
@@ -2195,20 +2224,30 @@ def _save_tool_output(scan_id, tool_key, raw_target, raw_output):
         target_slug = '__' + _safe_slug(raw_target, 30)
     fname = f"{step:02d}_{tool_key}{target_slug}.txt"
     try:
-        (out_dir / fname).write_text(raw_output, encoding='utf-8', errors='replace')
+        path = out_dir / fname
+        path.write_text(raw_output, encoding='utf-8', errors='replace')
+        return str(path)
     except Exception:
-        pass   # nunca deixar falha de I/O quebrar o scan
+        return None   # nunca deixar falha de I/O quebrar o scan
+
+def _record_host_attempt(scan_id, tool_key, raw_target, status, exit_code=None, output_path=None):
+    try:
+        host_store.record_run(scan_id, tool_key, raw_target, status, exit_code, output_path)
+    except (ValueError, sqlite3.Error):
+        pass
 
 def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None, outcome=None):
     if outcome is not None:
         outcome.update(status='skipped', reason='Ferramenta indisponível ou alvo inválido')
     tool = TOOLS.get(tool_key)
     if not tool:
+        _record_host_attempt(scan_id, tool_key, raw_target, 'skipped')
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':'Tool não existe'}, room=sid)
         return '', []
 
     if not check_binary(tool['binary']):
+        _record_host_attempt(scan_id, tool_key, raw_target, 'skipped')
         if outcome is not None:
             outcome['reason'] = f"Binário {tool['binary']} não instalado"
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
@@ -2218,6 +2257,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
     proxy = dict(active_proxy)
     cmd, effective_target = build_cmd(tool_key, raw_target, proxy, request_context)
     if cmd is None:
+        _record_host_attempt(scan_id, tool_key, raw_target, 'skipped')
         if outcome is not None:
             outcome['reason'] = effective_target
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
@@ -2286,12 +2326,20 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         killer.cancel()
         elapsed = round(time.time() - start, 1)
         raw = '\n'.join(output_lines)
-        _save_tool_output(scan_id, tool_key, raw_target, raw)
+        output_path = _save_tool_output(scan_id, tool_key, raw_target, raw)
+        run_status = 'completed' if proc.returncode == 0 and not timed_out['flag'] else 'failed'
         if outcome is not None:
-            outcome.update(status='completed' if proc.returncode == 0 and not timed_out['flag'] else 'failed',
+            outcome.update(status=run_status,
                            exit_code=proc.returncode, timed_out=timed_out['flag'])
         assets, findings = parse_output(tool_key, raw)
         persist_and_emit_findings(scan_id, assets, findings, sid)
+        try:
+            _record_host_attempt(scan_id, tool_key, raw_target, run_status, proc.returncode, output_path)
+            host_store.record_assets(scan_id, raw_target, assets)
+            if run_status == 'completed':
+                host_store.record_services(scan_id, raw_target, tool_key, raw)
+        except (ValueError, sqlite3.Error):
+            pass  # target de pivô inválido ou persistência indisponível não interrompe o scan
         extracted = assets
 
         # Coleta followup tips da tool executada
@@ -2311,6 +2359,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         return raw, extracted
 
     except Exception as e:
+        _record_host_attempt(scan_id, tool_key, raw_target, 'failed')
         if outcome is not None:
             outcome.update(status='failed', reason=str(e))
         socketio.emit('tool_error', {'scan_id':scan_id,'tool':tool_key,'error':str(e)}, room=sid)
@@ -2519,7 +2568,7 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
 
         for raw_target in target_list:
             raw, extracted = run_tool_sequential(scan_id, tool_key, raw_target, sid)
-            key = f"{tool_key}::{raw_target[:80]}"
+            key = f"{tool_key}::{raw_target}"
             stage_results[key] = {'raw': raw, 'targets': extracted}
             all_extracted.extend(extracted)
             tool = TOOLS.get(tool_key, {})
@@ -2559,12 +2608,16 @@ def run_ai_pipeline(scan_id, sid):
         return ai_pipeline.request_decision(context, proxy)
 
     def approve(action):
-        gate = ai_pipeline.Approval(sid, action)
+        gate = ai_pipeline.Approval(sid, action, timeout=1800 if action['tool'] == 'ai_manual' else 300)
         scan['ai_approval'] = gate
         scan['status'] = 'ai_approval'
-        emit_ai('ai_approval_required', {**action, 'proposal_id': gate.id, 'expires_in': 300})
+        emit_ai('ai_approval_required', {**action, 'proposal_id': gate.id,
+                                         'expires_in': 1800 if action['tool'] == 'ai_manual' else 300})
         try:
-            return gate.wait(lambda: scan.get('cancelled', False))
+            approved = gate.wait(lambda: scan.get('cancelled', False))
+            if approved and action['tool'] == 'ai_manual':
+                return gate.observation
+            return approved
         finally:
             scan.pop('ai_approval', None)
             scan['status'] = 'running'
@@ -2572,7 +2625,7 @@ def run_ai_pipeline(scan_id, sid):
 
     def execute(tool, target):
         # Second validation at the execution boundary, independent of the model.
-        if tool not in ai_pipeline.CATALOG or scoped_url(config['seeds'][0], target) != target:
+        if tool not in ai_pipeline.CATALOG or tool == 'ai_manual' or scoped_url(config['seeds'][0], target) != target:
             raise ValueError('Ação fora do catálogo/escopo')
         outcome = {}
         raw, _ = run_tool_sequential(scan_id, tool, target, sid, outcome=outcome)
@@ -2613,7 +2666,7 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
         for tool_key in stage['tools']:
             all_followups.extend(TOOLS.get(tool_key, {}).get('manual_followup', []))
 
-        if i < len(stages) - 1:
+        if i < len(stages) - 1 and not pipeline_def.get('profile_segmented'):
             # Só pivota em alvos acionáveis (host/url/path). Findings nunca viram alvo.
             pivots = [t for t in extracted if t.get('type') in ('host', 'url', 'path')]
             if pivots:
@@ -2732,6 +2785,47 @@ def index():
 @app.route('/api/proxy/status')
 def api_proxy_status():
     return jsonify(proxy_status())
+
+@app.route('/api/hosts', methods=['GET', 'POST'])
+def api_hosts():
+    if request.method == 'GET':
+        return jsonify(host_store.list_hosts())
+    data = request.get_json(silent=True) or {}
+    try:
+        host_id = host_store.ensure(data.get('target'))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(host_store.get(host_id)), 201
+
+@app.route('/api/hosts/<int:host_id>')
+def api_host(host_id):
+    profile = host_store.get(host_id)
+    return jsonify(profile) if profile else (jsonify({'error': 'Host não encontrado'}), 404)
+
+@app.route('/api/hosts/<int:host_id>/runs/<int:run_id>/output')
+def api_host_run_output(host_id, run_id):
+    run = host_store.get_run(host_id, run_id)
+    if not run or not run['output_path']:
+        return jsonify({'error': 'Output não encontrado'}), 404
+    output = Path(run['output_path']).resolve()
+    if not output.is_relative_to(RESULTS_DIR.resolve()) or not output.is_file():
+        return jsonify({'error': 'Output não disponível'}), 404
+    with output.open('rb') as stream:
+        raw = stream.read(200001)
+    text = raw[:200000].decode('utf-8', errors='replace')
+    if len(raw) > 200000:
+        text += '\n\n[Output truncado na visualização: consulte o arquivo local completo]'
+    return Response(text, mimetype='text/plain; charset=utf-8')
+
+@app.route('/api/hosts/<int:host_id>/checks/<key>', methods=['PUT'])
+def api_host_check(host_id, key):
+    data = request.get_json(silent=True) or {}
+    try:
+        updated = host_store.update_check(host_id, key, data.get('status'),
+                                          data.get('note', ''), data.get('evidence', ''))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'ok': True}) if updated else (jsonify({'error': 'Host não encontrado'}), 404)
 
 @app.route('/api/results')
 def api_results():
@@ -3199,6 +3293,17 @@ def on_start(data):
     except ValueError as exc:
         emit('error', {'message': str(exc)}); return
 
+    try:
+        host_id = host_store.ensure(target)
+    except ValueError as exc:
+        emit('error', {'message': str(exc)}); return
+
+    if pipeline_key in ('web_recon', 'api_recon'):
+        profile = host_store.get(host_id)
+        suggestion = next(s for s in profile['suggestions'] if s['key'] == pipeline_key)
+        if not suggestion['ready']:
+            emit('error', {'message': f"Pipeline ainda não liberado: {suggestion['reason']}"}); return
+
     scan_id = str(uuid.uuid4())[:8]
     pipeline_def = PIPELINES.get(pipeline_key, {})
     active_scans[scan_id] = {
@@ -3209,9 +3314,10 @@ def on_start(data):
     }
     db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
                    proxy_status().get('profile', 'none'))
+    host_store.ensure(target, scan_id)
 
     emit('pipeline_started', {
-        'scan_id': scan_id, 'target': target,
+        'scan_id': scan_id, 'target': target, 'host_id': host_id,
         'pipeline': pipeline_def.get('label', 'Custom'),
         'proxy': proxy_status(),
     })
@@ -3267,7 +3373,7 @@ def on_ai_action_response(data):
     scan = active_scans.get(data.get('scan_id'))
     gate = scan.get('ai_approval') if scan else None
     if (not scan or scan.get('sid') != request.sid or scan.get('cancelled') or not gate
-            or not gate.resolve(request.sid, data.get('proposal_id'), data.get('approved'))):
+            or not gate.resolve(request.sid, data.get('proposal_id'), data.get('approved'), data.get('observation', ''))):
         emit('error', {'message': 'Autorização inválida, expirada ou já utilizada'})
 
 

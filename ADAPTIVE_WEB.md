@@ -85,23 +85,22 @@ Esse fluxo tem BlackBox/WhiteBox e autorização por ação; não é a geração
 Configure no ambiente do processo ReconX:
 
 ```bash
-export RECONX_AI_MODEL="gpt-4o-mini"
-read -rsp 'Chave da API: ' RECONX_AI_KEY; echo
-export RECONX_AI_KEY
-sudo --preserve-env=RECONX_AI_KEY,RECONX_AI_MODEL reconx
+export GEMINI_MODEL="gemini-3.8-flash"
+read -rsp 'Chave Gemini: ' GEMINI_API_KEY; echo
+export GEMINI_API_KEY
+sudo --preserve-env=GEMINI_API_KEY,GEMINI_MODEL reconx
 ```
 
-`OPENAI_API_KEY` também é aceito como alternativa à chave. O endpoint padrão
-é `https://api.openai.com/v1/chat/completions`; `RECONX_AI_URL` permite indicar
-outro endpoint compatível, usando HTTPS (HTTP somente para localhost).
-O modelo precisa aceitar `response_format: json_schema`. Essa integração segue
-a [documentação oficial de Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs).
+O cliente usa o endpoint HTTPS `generateContent` do Gemini e saída JSON
+estruturada. `GEMINI_MODEL` é opcional; o padrão é `gemini-3.8-flash`. O modelo
+precisa estar disponível para a sua chave. Veja a
+[documentação oficial](https://ai.google.dev/api/generate-content).
 Respostas recusadas, incompletas ou fora do esquema interrompem a geração;
 não há fallback silencioso para uma lista diferente. Conteúdo das páginas é
 tratado como dados, sem poder escolher comandos, escopo ou limites.
 
 A geração utiliza o proxy selecionado, inclusive SOCKS via curl, e não segue
-redirecionamentos do provedor. Sem chave/modelo configurados, esse modo informa
+redirecionamentos do provedor. Sem chave configurada, esse modo informa
 o motivo e os outros testes seguem. A consulta pode gerar cobrança no provedor.
 
 Validação local: `python3 -m unittest discover -s tests -v`.
