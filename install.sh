@@ -118,6 +118,15 @@ ok "Diretórios em $APP_DIR"
 info "Copiando app.py e templates..."
 cp "$SCRIPT_DIR/app.py"                   "$APP_DIR/app.py"
 cp "$SCRIPT_DIR/templates/index.html"     "$APP_DIR/templates/index.html"
+if [[ -f "$SCRIPT_DIR/update.sh" ]]; then
+    cp "$SCRIPT_DIR/update.sh" "$APP_DIR/update.sh"
+    chmod +x "$APP_DIR/update.sh"
+fi
+if git -C "$SCRIPT_DIR" rev-parse HEAD > "$APP_DIR/.reconx-version" 2>/dev/null; then
+    ok "Versão instalada registrada"
+else
+    rm -f "$APP_DIR/.reconx-version"
+fi
 ok "Arquivos copiados"
 
 # ── Dependências Python ────────────────────────────────────────────
@@ -401,6 +410,7 @@ echo ""
 echo -e "  Iniciar:   ${YELLOW}reconx${NC}  ou  ${YELLOW}sudo python3 $APP_DIR/app.py${NC}"
 echo -e "  Expor LAN: ${YELLOW}reconx --expose${NC}  (bind 0.0.0.0 — use com cautela)"
 echo -e "  Interface: ${CYAN}http://localhost:5000${NC}"
+echo -e "  Atualizar: ${YELLOW}sudo bash $APP_DIR/update.sh${NC}"
 echo -e "  Relatório: ${CYAN}http://localhost:5000/api/report/<scan_id>${NC} (Markdown)"
 echo ""
 echo -e "  ${CYAN}Novidades v5:${NC} timeout por tool, bind seguro (127.0.0.1),"
