@@ -445,6 +445,54 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
     </div>
   </div>
 
+  <details class="sb-sec" style="max-height:310px;overflow:auto">
+    <summary class="sb-hd" style="cursor:pointer">Pipeline orientado por IA</summary>
+    <div class="tgt-wrap">
+      <div class="proxy-tip">Selecione “Triagem orientada por IA” nos pipelines. Escopo fixo na origem inicial; não usa o campo de escopo ampliado.</div>
+      <select class="proxy-input" id="ai-mode">
+        <option value="blackbox">BlackBox</option>
+        <option value="whitebox">WhiteBox / contexto adicional</option>
+      </select>
+      <textarea class="proxy-input" id="ai-endpoints" rows="3" maxlength="4000" placeholder="WhiteBox: um endpoint por linha (/login, /user?id=1)"></textarea>
+      <textarea class="proxy-input" id="ai-context" rows="3" maxlength="6000" placeholder="WhiteBox: tecnologias, parâmetros, comportamento esperado. Não inclua senhas/chaves."></textarea>
+      <label style="font-size:9px">Limite de ações (1–20)</label>
+      <input class="proxy-input" id="ai-steps" type="number" min="1" max="20" value="8">
+      <label style="font-size:10px"><input id="ai-consent" type="checkbox"> Autorizo envio de contexto e outputs sanitizados ao provedor. Pode haver dados sensíveis residuais e custos.</label>
+    </div>
+  </details>
+
+  <details class="sb-sec" style="max-height:310px;overflow:auto">
+    <summary class="sb-hd" style="cursor:pointer">Testes de login / wordlists</summary>
+    <div class="tgt-wrap">
+      <label style="font-size:10px"><input type="checkbox" id="login-enabled" onchange="toggleLoginOptions()"> Testar logins descobertos</label>
+      <div id="login-options" style="display:none;margin-top:8px">
+        <select class="proxy-input" id="login-mode" onchange="toggleLoginOptions()">
+          <option value="custom">Wordlists personalizadas</option>
+          <option value="ai">Gerar wordlists por IA</option>
+        </select>
+        <div id="login-custom">
+          <input class="proxy-input" id="login-users" placeholder="Usuários: /caminho/users.txt" aria-label="Caminho da wordlist de usuários">
+          <input class="proxy-input" id="login-passwords" placeholder="Senhas: /caminho/passwords.txt" aria-label="Caminho da wordlist de senhas">
+          <div class="proxy-tip">Caminhos na VM onde o ReconX está rodando. Um candidato por linha.</div>
+        </div>
+        <div id="login-ai" style="display:none">
+          <label style="font-size:9px">Candidatos por lista (até 100)</label>
+          <input class="proxy-input" type="number" id="login-ai-count" value="20" min="1" max="100">
+          <div class="proxy-tip">Texto público do site será enviado ao provedor de IA configurado no servidor.</div>
+        </div>
+        <input class="proxy-input" id="login-user-field" placeholder="Campo usuário (auto se vazio)">
+        <input class="proxy-input" id="login-password-field" placeholder="Campo senha (auto se vazio)">
+        <input class="proxy-input" id="login-success-path" placeholder="Caminho após login: /dashboard.php">
+        <input class="proxy-input" id="login-success-text" placeholder="Ou texto de sucesso: Bem-vindo">
+        <div class="proxy-tip">Informe caminho e/ou texto de sucesso. Se informar ambos, ambos devem corresponder.</div>
+        <label style="font-size:9px">Tentativas totais (inclui controles inválidos)</label>
+        <input class="proxy-input" type="number" id="login-attempts" value="20" min="3" max="1000">
+        <label style="font-size:9px">Intervalo entre tentativas (segundos)</label>
+        <input class="proxy-input" type="number" id="login-delay" value="1" min="1" max="30">
+      </div>
+    </div>
+  </details>
+
   <!-- Pipelines -->
   <div class="sb-sec">
     <div class="sb-hd">Pipelines
@@ -591,6 +639,16 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
 </div><!-- /app -->
 
 <div class="toast" id="toast"></div>
+<div id="ai-approval-overlay" style="display:none;position:fixed;inset:0;background:#000b;z-index:10000;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--o);border-radius:8px;padding:22px;max-width:700px;width:90%;max-height:85vh;overflow:auto">
+    <h3>Autorizar uma ação da IA</h3>
+    <pre id="ai-approval-text" style="white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--mono)"></pre>
+    <div class="proxy-tip">A aprovação vale apenas para esta ferramenta e este alvo. Expira em 5 minutos. Não autoriza próximas ações.</div>
+    <button class="btn btn-r" id="ai-reject" onclick="respondAiAction(false)">Rejeitar</button>
+    <button class="btn btn-o" id="ai-approve" onclick="respondAiAction(true)">Autorizar esta ação</button>
+    <button class="btn btn-r" onclick="stopScan()">Cancelar scan</button>
+  </div>
+</div>
 
 <!-- DATA INJECTION (safe JSON) -->
 <script type="application/json" id="_tools">{{ tools_json | safe }}</script>
@@ -730,6 +788,40 @@ socket.on('checkpoint_auto', d => {
   tlog('lg', `  [→] Continuando para: ${d.next_stage} com ${d.approved_count} targets`);
 });
 
+let pendingAiAction = null;
+socket.on('ai_decision', d => {
+  if (d.scan_id !== S.scanId) return;
+  tlog('lp', `[IA] ${d.summary}`);
+  tlog('lc', `[IA] ${d.reason} — evidência: ${d.evidence || 'não informada'}`);
+});
+socket.on('ai_error', d => {
+  if (d.scan_id === S.scanId) tlog('lo', `[IA interrompida] ${d.message}`);
+});
+socket.on('ai_approval_required', d => {
+  if (d.scan_id !== S.scanId) return;
+  pendingAiAction = d;
+  document.getElementById('ai-approval-text').textContent =
+    `Ferramenta: ${d.tool}\nAlvo: ${d.target}\nImpacto: ${d.impact}\n\nMotivo: ${d.reason}\nEvidência: ${d.evidence}\n\nResumo: ${d.summary}`;
+  document.getElementById('ai-approve').disabled = false;
+  document.getElementById('ai-reject').disabled = false;
+  document.getElementById('ai-approval-overlay').style.display = 'flex';
+  setRunSt('IA aguardando autorização...');
+});
+socket.on('ai_approval_closed', d => {
+  if (pendingAiAction?.proposal_id !== d.proposal_id) return;
+  pendingAiAction = null;
+  document.getElementById('ai-approval-overlay').style.display = 'none';
+  setRunSt('IA continuando...');
+});
+function respondAiAction(approved) {
+  if (!pendingAiAction) return;
+  document.getElementById('ai-approve').disabled = true;
+  document.getElementById('ai-reject').disabled = true;
+  socket.emit('ai_action_response', {
+    scan_id: pendingAiAction.scan_id, proposal_id: pendingAiAction.proposal_id, approved,
+  });
+}
+
 socket.on('checkpoint', d => {
   tlog('','');
   tlog('lo','━'.repeat(58));
@@ -752,6 +844,7 @@ socket.on('scope_warning', d => {
 });
 
 socket.on('pipeline_complete', d => {
+  if (d.scan_id !== S.scanId && d.scan_id !== S.lastScanId) return;
   S.running = false; S.scanId = null;
   setProgress(100);
   document.getElementById('stop-btn').style.display = 'none';
@@ -760,9 +853,9 @@ socket.on('pipeline_complete', d => {
   setRunSt('');
   tlog('','');
   tlog('lm','═'.repeat(58));
-  tlog('lg','[✓] SCAN CONCLUÍDA');
+  tlog(d.status === 'failed' ? 'lo' : 'lg', d.status === 'failed' ? '[!] SCAN INTERROMPIDA POR FALHA' : '[✓] SCAN FINALIZADA');
   tlog('lm','═'.repeat(58));
-  toast('Scan concluída!','ok');
+  toast(d.status === 'failed' ? 'Scan interrompida; veja o erro no terminal' : 'Scan finalizada', d.status === 'failed' ? 'warn' : 'ok');
   // Load action items (auto-muda para aba Ação se tiver imediatos)
   const finishedId = d.scan_id || S.scanId;
   if (finishedId) loadActionItems(finishedId);
@@ -775,6 +868,8 @@ socket.on('pipeline_complete', d => {
 });
 
 socket.on('scan_cancelled', () => {
+  pendingAiAction = null;
+  document.getElementById('ai-approval-overlay').style.display = 'none';
   S.running = false; S.scanId = null;
   document.getElementById('stop-btn').style.display = 'none';
   document.getElementById('run-btn').disabled = false;
@@ -978,6 +1073,27 @@ function markAllDone() {
 function startScan() {
   const target = document.getElementById('tgt').value.trim();
   if (!target || !S.steps.length || S.running) return;
+  const loginTesting = {
+    enabled: document.getElementById('login-enabled').checked,
+    mode: document.getElementById('login-mode').value,
+    users_path: document.getElementById('login-users').value,
+    passwords_path: document.getElementById('login-passwords').value,
+    username_field: document.getElementById('login-user-field').value,
+    password_field: document.getElementById('login-password-field').value,
+    success_path: document.getElementById('login-success-path').value,
+    success_text: document.getElementById('login-success-text').value,
+    max_attempts: document.getElementById('login-attempts').value,
+    delay: document.getElementById('login-delay').value,
+    ai_count: document.getElementById('login-ai-count').value,
+  };
+  const ai = S.selectedPreset === 'ai_guided';
+  if (ai && !document.getElementById('ai-consent').checked) {
+    toast('Confirme o envio de contexto e outputs ao provedor de IA', 'warn'); return;
+  }
+  if (ai) loginTesting.enabled = false;
+  if (loginTesting.enabled && !loginTesting.success_path && !loginTesting.success_text) {
+    toast('Informe caminho ou texto de sucesso do login', 'warn'); return;
+  }
   clearTerm(); S.followups = [];
   // Build custom stages from flat step list
   const stages = [{ id:'custom', name:'Custom', tools: S.steps.map(s=>s.tool), phase:'recon' }];
@@ -985,8 +1101,25 @@ function startScan() {
     target,
     pipeline_key: S.selectedPreset,
     custom_stages: S.selectedPreset ? null : stages,
+    login_testing: loginTesting,
+    ai_config: ai ? {
+      mode: document.getElementById('ai-mode').value,
+      context: document.getElementById('ai-context').value,
+      endpoints: document.getElementById('ai-endpoints').value,
+      max_steps: document.getElementById('ai-steps').value,
+      consent: document.getElementById('ai-consent').checked,
+    } : null,
   });
 }
+
+function toggleLoginOptions() {
+  document.getElementById('login-options').style.display = document.getElementById('login-enabled').checked ? '' : 'none';
+  const ai = document.getElementById('login-mode').value === 'ai';
+  document.getElementById('login-custom').style.display = ai ? 'none' : '';
+  document.getElementById('login-ai').style.display = ai ? '' : 'none';
+}
+
+socket.on('error', d => toast(d.message || 'Falha ao iniciar scan', 'warn'));
 
 function stopScan() {
   if (S.scanId) socket.emit('cancel_scan', { scan_id: S.scanId });

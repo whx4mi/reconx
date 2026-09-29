@@ -7,6 +7,7 @@ import http.cookiejar
 import urllib.request
 import subprocess
 import os
+from login_testing import candidate_sources, run_login_tests, eligible_login_forms, validate_config
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qsl, urlsplit
@@ -200,6 +201,49 @@ class WebIntelligenceTests(unittest.TestCase):
         jobs, pending = plan_tests(BASE, [page], max_jobs=1)
         self.assertTrue(jobs[0]['form']['login'])
         self.assertTrue(any(p['reason'] == 'Limite de tarefas atingido' for p in pending))
+
+    def test_adaptive_custom_login_stores_credentials_separately(self):
+        ns = load_helpers()
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_adaptive_web')
+        ns.update(tempfile=tempfile, http=http, urllib=urllib, json=json, os=os,
+                  discover=discover, plan_tests=plan_tests, parse_page=parse_page,
+                  form_request=form_request, scoped_url=scoped_url,
+                  candidate_sources=candidate_sources, eligible_login_forms=eligible_login_forms,
+                  run_login_tests=run_login_tests, _finding=lambda *args: {})
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)
+        html = '<h1>MeOwna</h1><form method=POST action=login.php><input name=user><input type=password name=pass></form>'
+        submitted = []
+        def curl(cmd, **kwargs):
+            body = html
+            if '--data-binary' in cmd:
+                data = Path(cmd[cmd.index('--data-binary') + 1][1:]).read_text()
+                from urllib.parse import parse_qsl
+                fields = dict(parse_qsl(data))
+                submitted.append(fields)
+                body = 'Authenticated' if fields['user'] == 'student' and fields['pass'] == 'labpass' else 'Invalid'
+            Path(cmd[cmd.index('--dump-header') + 1]).write_text('HTTP/1.1 200 OK\nContent-Type: text/html\n\n')
+            Path(cmd[cmd.index('--output') + 1]).write_text(body)
+            return MagicMock(returncode=0)
+        ns['run_tool_sequential'] = lambda *args: ('ok', [])
+        with tempfile.TemporaryDirectory() as output:
+            output = Path(output)
+            (output / 'users.txt').write_text('student\n')
+            (output / 'passwords.txt').write_text('labpass\n')
+            ns['active_scans']['scan'].update(target=BASE, login_testing=validate_config({
+                'enabled': True, 'mode': 'custom', 'users_path': str(output / 'users.txt'),
+                'passwords_path': str(output / 'passwords.txt'), 'success_text': 'Authenticated'}))
+            ns['_scan_output_dir'] = lambda s: output
+            with patch.object(subprocess, 'run', side_effect=curl), patch('login_testing.time.sleep'):
+                # The wait callback is bound at definition; replace it in this fixture.
+                ns['run_login_tests'] = lambda *a, **kw: run_login_tests(*a, **kw, wait=lambda seconds: None)
+                ns['run_adaptive_web']('scan', [BASE], 'sid')
+            public = (output / 'adaptive_report.json').read_text(encoding='utf-8')
+            private = json.loads((output / 'login_credentials.json').read_text(encoding='utf-8'))
+            self.assertNotIn('labpass', public)
+            self.assertEqual(private[0]['password'], 'labpass')
+            self.assertEqual(json.loads(public)['login_testing']['status'], 'matched')
+        self.assertEqual(len(submitted), 3)
 
 
 if __name__ == '__main__':

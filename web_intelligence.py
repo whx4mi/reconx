@@ -31,9 +31,13 @@ class PageParser(HTMLParser):
         self.textarea = None
         self.select = None
         self.option = None
+        self.public_text = ''
+        self.ignore_text = 0
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if tag in ('script', 'style', 'textarea'):
+            self.ignore_text += 1
         if tag == 'a' and a.get('href'):
             self.links.append(urljoin(self.url, a['href']))
         if tag == 'form':
@@ -71,12 +75,16 @@ class PageParser(HTMLParser):
             self.option = {'value': a.get('value'), 'text': '', 'selected': 'selected' in a}
 
     def handle_data(self, data):
+        if not self.ignore_text and len(self.public_text) < 2000:
+            self.public_text += ' ' + ' '.join(data.split())[:2000 - len(self.public_text)]
         if self.textarea is not None:
             self.textarea['value'] += data
         if self.option is not None:
             self.option['text'] += data
 
     def handle_endtag(self, tag):
+        if tag in ('script', 'style', 'textarea'):
+            self.ignore_text = max(0, self.ignore_text - 1)
         if tag == 'option' and self.option is not None and self.select is not None:
             if self.option['selected'] or not self.select['_chosen']:
                 self.select['value'] = self.option['value'] if self.option['value'] is not None else self.option['text']

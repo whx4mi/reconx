@@ -27,6 +27,8 @@ import tempfile
 import http.cookiejar
 import urllib.request
 from web_intelligence import discover, plan_tests, parse_page, form_request, scoped_url
+from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
+import ai_pipeline
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('RECONX_SECRET') or secrets.token_hex(16)
@@ -1282,7 +1284,31 @@ MANUAL_CHECKLIST = {
 }
 
 # ── Pipelines ──────────────────────────────────────────────────────────────────
+# Separate fixed templates: the AI cannot alter arguments or follow redirects.
+TOOLS.update({
+    'ai_headers': {'label': 'IA: HTTP HEAD', 'phase': 'recon', 'category': 'web',
+        'desc': 'Headers sem redirects', 'cmd': ['curl', '-q', '-sS', '-I', '--max-time', '15', '{url}'],
+        'input': 'url', 'output': 'headers', 'binary': 'curl', 'tags': ['fast'], 'timeout': 20, 'proxy_support': True},
+    'ai_page': {'label': 'IA: leitura de página', 'phase': 'recon', 'category': 'web',
+        'desc': 'GET limitado, sem redirects', 'cmd': ['curl', '-q', '-sS', '-i', '--max-time', '15',
+            '--max-filesize', '262144', '{url}'],
+        'input': 'url', 'output': 'raw', 'binary': 'curl', 'tags': ['active'], 'timeout': 20, 'proxy_support': True},
+    'ai_ports': {'label': 'IA: TCP top 100', 'phase': 'recon', 'category': 'ports',
+        'desc': 'TCP connect, sem NSE', 'cmd': ['nmap', '-sT', '-Pn', '--top-ports', '100',
+            '--max-retries', '1', '--host-timeout', '60s', '{host}'],
+        'input': 'host', 'output': 'ports', 'binary': 'nmap', 'tags': ['active'], 'timeout': 75},
+    'ai_tls': {'label': 'IA: TLS', 'phase': 'test', 'category': 'crypto',
+        'desc': 'Protocolos e ciphers TLS', 'cmd': ['testssl.sh', '--quiet', '--color', '0',
+            '--protocols', '--server-defaults', '{url}'],
+        'input': 'url', 'output': 'raw', 'binary': 'testssl.sh', 'tags': ['active'], 'timeout': 120, 'proxy_support': True},
+})
+
 PIPELINES = {
+    'ai_guided': {
+        'label': 'Triagem orientada por IA', 'icon': '◇', 'color': '#bd93f9',
+        'desc': 'BlackBox / WhiteBox: decisões auditáveis e aprovação por ação ativa',
+        'stages': [{'id': 'ai', 'name': 'Triagem IA', 'phase': 'recon', 'tools': ['ai_headers']}],
+    },
     "ctf_box": {
         "label": "CTF / HTB Box", "icon": "⚡", "color": "#ffb86c",
         "desc": "Workflow completo para máquinas de CTF",
@@ -1414,6 +1440,8 @@ def check_binary(binary):
     return bool(shutil.which(binary))
 
 def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
+    if tool_key == 'ai_ports':
+        raw_target = urlsplit(ai_pipeline.canonical_target(raw_target)).hostname
     tool = TOOLS[tool_key]
     template = tool['cmd'][:]
     input_type = tool['input']
@@ -2294,7 +2322,7 @@ def run_adaptive_web(scan_id, targets, sid):
     report = {'pages': [], 'forms': [], 'tasks': [], 'pending': [], 'errors': [],
               'limits': {'pages': 12, 'depth': 2, 'jobs': 12}, 'truncated': False,
               'limitations': ['HTML estático: formulários gerados por JavaScript não são analisados',
-                              'Sem autenticação automática/BF; uploads e fluxos com alteração destrutiva exigem revisão',
+                              'Login por listas exige configuração e critério de sucesso; uploads e fluxos destrutivos exigem revisão',
                               'completed indica processo concluído, não ausência de vulnerabilidades']}
     for key, variable, ceiling in (('pages', 'RECONX_ADAPTIVE_PAGES', 200),
                                     ('depth', 'RECONX_ADAPTIVE_DEPTH', 5),
@@ -2314,7 +2342,7 @@ def run_adaptive_web(scan_id, targets, sid):
     with tempfile.TemporaryDirectory(prefix='reconx-web-') as temp:
         temp = Path(temp)
         cookie_file = temp / 'cookies.txt'
-        def fetch(url):
+        def fetch(url, request_data=None):
             if scan.get('cancelled'):
                 raise RuntimeError('Scan cancelado')
             if not scoped_url(initial, url):
@@ -2324,9 +2352,17 @@ def run_adaptive_web(scan_id, targets, sid):
                    '--max-filesize', '524288', '--dump-header', str(temp / 'headers'),
                    '--output', str(temp / 'body'), '--cookie', str(cookie_file),
                    '--cookie-jar', str(cookie_file), url]
+            if request_data is not None:
+                post_file = temp / 'login-post.txt'
+                post_file.write_text(request_data, encoding='utf-8')
+                post_file.chmod(0o600)
+                cmd += ['--data-binary', '@' + str(post_file)]
             cmd = inject_proxy(cmd, 'adaptive_web', proxy)
-            response = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
-                                      env=proxy_env('adaptive_web', proxy))
+            try:
+                response = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                                          env=proxy_env('adaptive_web', proxy))
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('Timeout ao buscar/enviar formulário; requisição interrompida') from None
             if response.returncode:
                 raise RuntimeError(f'Falha curl ({response.returncode}) ao buscar página')
             blocks = re.split(r'\r?\n\r?\n', (temp / 'headers').read_text(errors='replace').strip())
@@ -2337,6 +2373,7 @@ def run_adaptive_web(scan_id, targets, sid):
             metadata = dict((k.strip().lower(), v.strip()) for line in lines[1:] if ':' in line
                             for k, v in [line.split(':', 1)])
             return {'status': int(lines[0].split()[1]), 'location': metadata.get('location', ''),
+                    'url': url,
                     'content_type': metadata.get('content-type', ''),
                     'body': (temp / 'body').read_text(encoding='utf-8', errors='replace')}
         def cookie_header(url):
@@ -2350,7 +2387,50 @@ def run_adaptive_web(scan_id, targets, sid):
                                                                max_pages=report['limits']['pages'],
                                                                max_depth=report['limits']['depth'],
                                                                cancelled=lambda: scan.get('cancelled', False))
+        login_config = scan.get('login_testing', {'enabled': False})
+        if login_config.get('enabled') and not scan.get('cancelled'):
+            log(f"[Login] Preparando wordlists: {login_config['mode']}")
+            try:
+                if not eligible_login_forms(initial, [f for p in pages for f in p.forms]):
+                    raise ValueError('Nenhum formulário de login POST descoberto; wordlists não foram geradas')
+                proxy = dict(active_proxy)
+                _proxy_url_if_alive(proxy)
+                public_context = json.dumps([{'path': urlsplit(p.url).path, 'text': p.public_text,
+                    'fields': [v['name'] for f in p.forms for v in f['fields'] if v['type'] != 'hidden']}
+                    for p in pages], ensure_ascii=False)[:8000]
+                users, passwords = candidate_sources(login_config, public_context, proxy)
+                output_dir = _scan_output_dir(scan_id)
+                if login_config['mode'] == 'ai':
+                    for name, words in (('generated_users.txt', users), ('generated_passwords.txt', passwords)):
+                        file = output_dir / name
+                        file.write_text('\n'.join(words) + '\n', encoding='utf-8')
+                        file.chmod(0o600)
+                log(f"[Login] {len(users)} usuários, {len(passwords)} senhas; limite total {login_config['max_attempts']} tentativas")
+                login_report = run_login_tests(initial, [f for p in pages for f in p.forms], login_config,
+                    users, passwords, fetch, lambda request: fetch(request['url'], request['data']),
+                    cancelled=lambda: scan.get('cancelled', False),
+                    reset_session=lambda: cookie_file.unlink(missing_ok=True))
+                credentials = login_report.pop('credentials', [])
+                if credentials:
+                    credentials_file = output_dir / 'login_credentials.json'
+                    # Exclusive create with owner-only permissions before writing.
+                    fd = os.open(str(credentials_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                        json.dump(credentials, stream, ensure_ascii=False, indent=2)
+                    login_report['credentials_file'] = str(credentials_file)
+                    persist_and_emit_findings(scan_id, [], [_finding('adaptive_web', 'auth',
+                        'Login corresponde ao critério configurado', 'high', credentials[0]['url'],
+                        'Duas tentativas inválidas rejeitadas; candidato corresponde ao critério. Senha omitida; valide a sessão.', 'likely')], sid)
+                report['login_testing'] = login_report
+                log(f"[Login] {login_report['status']}; {login_report['attempts']} tentativas. {login_report.get('reason', '')}")
+            except (ValueError, OSError, RuntimeError) as exc:
+                report['login_testing'] = {'status': 'stopped', 'reason': str(exc)}
+                log(f'[Login] Não executado/interrompido: {exc}')
         jobs, report['pending'] = plan_tests(initial, pages, max_jobs=report['limits']['jobs'])
+        if login_config.get('enabled'):
+            for pending in report['pending']:
+                if 'BF e bypass lógico' in pending['reason']:
+                    pending['reason'] = 'Bypass lógico exige revisão; resultado das tentativas por lista está em login_testing'
         report['pages'] = [p.url for p in pages]
         report['forms'] = [{'page': f['page'], 'action': f['action'], 'method': f['method'],
                             'login': f['login'], 'fields': [v['name'] for v in f['fields']]}
@@ -2460,10 +2540,60 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
 
     return stage_results, unique
 
+def run_ai_pipeline(scan_id, sid):
+    scan = active_scans[scan_id]
+    config = scan['ai_config']
+    results = {}
+
+    def emit_ai(event, data):
+        socketio.emit(event, {'scan_id': scan_id, **data}, room=sid)
+
+    def save(report):
+        scan['ai_report'] = report
+        _scan_output_dir(scan_id).joinpath('ai_report.json').write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    def decide(context):
+        proxy = dict(active_proxy)
+        _proxy_url_if_alive(proxy)
+        return ai_pipeline.request_decision(context, proxy)
+
+    def approve(action):
+        gate = ai_pipeline.Approval(sid, action)
+        scan['ai_approval'] = gate
+        scan['status'] = 'ai_approval'
+        emit_ai('ai_approval_required', {**action, 'proposal_id': gate.id, 'expires_in': 300})
+        try:
+            return gate.wait(lambda: scan.get('cancelled', False))
+        finally:
+            scan.pop('ai_approval', None)
+            scan['status'] = 'running'
+            emit_ai('ai_approval_closed', {'proposal_id': gate.id})
+
+    def execute(tool, target):
+        # Second validation at the execution boundary, independent of the model.
+        if tool not in ai_pipeline.CATALOG or scoped_url(config['seeds'][0], target) != target:
+            raise ValueError('Ação fora do catálogo/escopo')
+        outcome = {}
+        raw, _ = run_tool_sequential(scan_id, tool, target, sid, outcome=outcome)
+        results[str(len(results) + 1)] = {tool: {'raw': raw}}
+        return raw, outcome
+
+    report = ai_pipeline.run(config, decide, execute, approve, emit_ai, save,
+                             lambda: scan.get('cancelled', False))
+    _finish(scan_id, results, scan['target'], [], sid)
+    status = 'cancelled' if scan.get('cancelled') else ('failed' if report['status'] == 'failed' else 'done')
+    scan['status'] = status
+    db_finish_scan(scan_id, status)
+
+
 def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, intensity='full'):
+    if active_scans.get(scan_id, {}).get('ai_config'):
+        return run_ai_pipeline(scan_id, sid)
     stages = list(custom_stages if custom_stages else pipeline_def.get('stages', []))
-    if (intensity == 'full' and pipeline_def.get('label') in
+    if (intensity == 'full' and (pipeline_def.get('label') in
             ('CTF / HTB Box', 'Web App Pentest', 'Full Pentest', 'Bug Bounty', 'API Pentest')
+            or active_scans.get(scan_id, {}).get('login_testing', {}).get('enabled'))
             and not any('adaptive_web' in s.get('tools', []) for s in stages)):
         index = next((i for i, s in enumerate(stages) if s.get('phase') == 'test'), len(stages))
         stages.insert(index, {'id': 'adaptive', 'name': 'Adaptive Web: formulários e parâmetros',
@@ -2529,6 +2659,11 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
     _finish(scan_id, all_results, initial_target, all_followups, sid)
 
 def _finish(scan_id, all_results, target, followups, sid):
+    ai_report = active_scans.get(scan_id, {}).get('ai_report')
+    completion_status = 'done'
+    if ai_report:
+        completion_status = ('cancelled' if active_scans[scan_id].get('cancelled') else
+                             ('failed' if ai_report.get('status') == 'failed' else 'done'))
     result_file = RESULTS_DIR / f"{scan_id}.json"
     with open(result_file, 'w') as f:
         json.dump({
@@ -2539,19 +2674,21 @@ def _finish(scan_id, all_results, target, followups, sid):
             'manual_followups': list(set(followups)),
             'manual_checklist': MANUAL_CHECKLIST,
             'adaptive_report': active_scans.get(scan_id, {}).get('adaptive_report'),
+            'ai_report': active_scans.get(scan_id, {}).get('ai_report'),
             'timestamp': datetime.now().isoformat(),
         }, f, indent=2)
 
     socketio.emit('pipeline_complete', {
         'scan_id': scan_id,
         'result_file': str(result_file),
+        'status': completion_status,
         'manual_checklist': MANUAL_CHECKLIST,
         'manual_followups': list(set(followups)),
     }, room=sid)
 
-    db_finish_scan(scan_id, 'done')
+    db_finish_scan(scan_id, completion_status)
     if scan_id in active_scans:
-        active_scans[scan_id]['status'] = 'done'
+        active_scans[scan_id]['status'] = completion_status
 
     # Webhook de notificação (Slack/Discord/custom)
     if WEBHOOK_URL:
@@ -3049,12 +3186,26 @@ def on_start(data):
 
     if not target:
         emit('error', {'message': 'Alvo obrigatório'}); return
+    try:
+        ai_config = None
+        if pipeline_key == 'ai_guided':
+            ai_config = ai_pipeline.validate_config(data.get('ai_config'), target)
+            target = ai_config['seeds'][0]
+            if custom_stages or (isinstance(data.get('login_testing'), dict) and data['login_testing'].get('enabled')):
+                raise ValueError('Pipeline IA não aceita etapas livres nem testes de login encadeados')
+        login_config = validate_login_config(data.get('login_testing'))
+        if login_config['enabled'] and data.get('intensity', 'full') != 'full':
+            raise ValueError('Testes de login exigem o perfil full')
+    except ValueError as exc:
+        emit('error', {'message': str(exc)}); return
 
     scan_id = str(uuid.uuid4())[:8]
     pipeline_def = PIPELINES.get(pipeline_key, {})
     active_scans[scan_id] = {
         'processes': {}, 'cancelled': False,
         'status': 'running', 'target': target, 'sid': sid, 'intensity': data.get('intensity', 'full'),
+        'login_testing': login_config,
+        'ai_config': ai_config,
     }
     db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
                    proxy_status().get('profile', 'none'))
@@ -3111,9 +3262,20 @@ def _in_scope(value, scope_list):
             return True
     return False
 
+@socketio.on('ai_action_response')
+def on_ai_action_response(data):
+    scan = active_scans.get(data.get('scan_id'))
+    gate = scan.get('ai_approval') if scan else None
+    if (not scan or scan.get('sid') != request.sid or scan.get('cancelled') or not gate
+            or not gate.resolve(request.sid, data.get('proposal_id'), data.get('approved'))):
+        emit('error', {'message': 'Autorização inválida, expirada ou já utilizada'})
+
+
 @socketio.on('checkpoint_approve')
 def on_approve(data):
     scan_id  = data.get('scan_id')
+    if active_scans.get(scan_id, {}).get('ai_config'):
+        emit('error', {'message': 'Use a aprovação específica da ação IA'}); return
     approved = data.get('approved_targets', [])
     scope    = data.get('scope', [])
     sid = request.sid
@@ -3173,6 +3335,9 @@ def on_approve(data):
 @socketio.on('cancel_scan')
 def on_cancel(data):
     scan_id = data.get('scan_id')
+    if (active_scans.get(scan_id, {}).get('ai_config') and
+            active_scans[scan_id].get('sid') != request.sid):
+        emit('error', {'message': 'Scan pertence a outra sessão'}); return
     if scan_id in active_scans:
         active_scans[scan_id]['cancelled'] = True
         for p in active_scans[scan_id]['processes'].values():
