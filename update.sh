@@ -89,10 +89,10 @@ fi
 [[ -f "$WORK_DIR/repo/app.py" && -f "$WORK_DIR/repo/templates/index.html" \
     && -f "$WORK_DIR/repo/update.sh" ]] || die 'Repositório sem arquivos obrigatórios'
 say 'Validando Python, updater e testes antes de substituir o app...'
-python3 - "$WORK_DIR/repo/app.py" <<'PY'
+python3 - "$WORK_DIR/repo" <<'PY'
 import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-compile(path.read_text(encoding='utf-8'), str(path), 'exec')
+for path in pathlib.Path(sys.argv[1]).glob('*.py'):
+    compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 PY
 bash -n "$WORK_DIR/repo/update.sh"
 python3 -c 'import flask, flask_socketio' || die 'Instale as dependências Python usando install.sh'

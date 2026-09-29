@@ -117,6 +117,7 @@ ok "Diretórios em $APP_DIR"
 # ── Copia arquivos ─────────────────────────────────────────────────
 info "Copiando app.py e templates..."
 cp "$SCRIPT_DIR/app.py"                   "$APP_DIR/app.py"
+cp "$SCRIPT_DIR/web_intelligence.py"      "$APP_DIR/web_intelligence.py"
 cp "$SCRIPT_DIR/templates/index.html"     "$APP_DIR/templates/index.html"
 if [[ -f "$SCRIPT_DIR/update.sh" ]]; then
     cp "$SCRIPT_DIR/update.sh" "$APP_DIR/update.sh"

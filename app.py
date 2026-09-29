@@ -23,6 +23,10 @@ from datetime import datetime
 from pathlib import Path
 import random
 from urllib.parse import urlsplit
+import tempfile
+import http.cookiejar
+import urllib.request
+from web_intelligence import discover, plan_tests, parse_page, form_request, scoped_url
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('RECONX_SECRET') or secrets.token_hex(16)
@@ -470,6 +474,13 @@ def proxy_env(tool_key=None, proxy=None) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOOLS = {
+    'adaptive_web': {
+        'label': 'Adaptive Web', 'phase': 'test', 'category': 'intelligence',
+        'desc': 'Descobre formulários/login e escolhe testes GET/POST por evidência',
+        'cmd': ['curl', '{url}'], 'input': 'url', 'output': 'raw',
+        'binary': 'curl', 'tags': ['active', 'crawl', 'params'],
+        'proxy_support': True, 'manual_followup': [],
+    },
     # RECON — SUBDOMÍNIOS
     "subfinder": {
         "label": "Subfinder", "phase": "recon", "category": "subdomains",
@@ -694,8 +705,8 @@ TOOLS = {
     "arjun": {
         "label": "Arjun (params)", "phase": "recon", "category": "fuzzing",
         "desc": "Descoberta de parâmetros HTTP ocultos (GET/POST)",
-        "cmd": ["arjun", "-u", "{http_url}", "-q"],
-        "input": "host", "output": "raw",
+        "cmd": ["arjun", "-u", "{url}", "-q"],
+        "input": "url", "output": "raw",
         "binary": "arjun", "tags": ["active","params"],
         "proxy_support": True, "timeout": 300,
         "manual_followup": [
@@ -733,9 +744,9 @@ TOOLS = {
     "katana": {
         "label": "Katana", "phase": "recon", "category": "osint",
         "desc": "Web crawler com suporte a JavaScript — analisa bundles JS em busca de endpoints",
-        "cmd": ["katana", "-u", "{http_url}", "-depth", "2", "-silent", "-jsonl",
+        "cmd": ["katana", "-u", "{url}", "-depth", "2", "-silent", "-jsonl",
                 "-jc", "-kf", "all"],
-        "input": "host", "output": "urls",
+        "input": "url", "output": "urls",
         "json": True, "binary": "katana", "tags": ["active","crawl"],
         "proxy_support": True,
         "manual_followup": [
@@ -835,9 +846,9 @@ TOOLS = {
     "sqlmap": {
         "label": "SQLMap (forms)", "phase": "test", "category": "injection",
         "desc": "SQL injection em formulários da página",
-        "cmd": ["sqlmap", "-u", "{http_url}", "--forms", "--batch",
+        "cmd": ["sqlmap", "-u", "{url}", "--forms", "--batch",
                 "--level=1", "--risk=1", "--random-agent", "--no-logging"],
-        "input": "host", "output": "sqli",
+        "input": "url", "output": "sqli",
         "binary": "sqlmap", "tags": ["active","sqli"],
         "proxy_support": True,
         "manual_followup": [
@@ -863,8 +874,8 @@ TOOLS = {
     "commix": {
         "label": "Commix", "phase": "test", "category": "injection",
         "desc": "Detecção de command injection",
-        "cmd": ["commix", "--url={http_url}", "--batch", "--level=1"],
-        "input": "host", "output": "cmdi",
+        "cmd": ["commix", "--url={url}", "--batch", "--level=1"],
+        "input": "url", "output": "cmdi",
         "binary": "commix", "tags": ["active","cmdi"],
         "proxy_support": True,
         "manual_followup": [
@@ -878,9 +889,9 @@ TOOLS = {
     "dalfox": {
         "label": "Dalfox (host)", "phase": "test", "category": "xss",
         "desc": "Scanner XSS no host — detecta e gera PoC",
-        "cmd": ["dalfox", "url", "{http_url}", "--no-color", "--silence",
+        "cmd": ["dalfox", "url", "{url}", "--no-color", "--silence",
                 "--follow-redirects"],
-        "input": "host", "output": "xss",
+        "input": "url", "output": "xss",
         "binary": "dalfox", "tags": ["active","xss"],
         "proxy_support": True,
         "manual_followup": [
@@ -1402,7 +1413,7 @@ active_scans = {}
 def check_binary(binary):
     return bool(shutil.which(binary))
 
-def build_cmd(tool_key, raw_target, proxy=None):
+def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
     tool = TOOLS[tool_key]
     template = tool['cmd'][:]
     input_type = tool['input']
@@ -1440,6 +1451,26 @@ def build_cmd(tool_key, raw_target, proxy=None):
         cmd = inject_proxy(cmd, tool_key, proxy)
     except ValueError as e:
         return None, str(e)
+
+    if request_context:
+        if tool_key not in ('sqlmap_url', 'dalfox_url'):
+            return None, 'Contexto de formulário não suportado por esta ferramenta'
+        if request_context.get('data') is not None:
+            cmd += ['--data', request_context['data']]
+        if request_context.get('cookie'):
+            cmd += ['--cookie', request_context['cookie']]
+        params = request_context.get('parameters', [])
+        if params:
+            if tool_key == 'dalfox_url':
+                for param in dict.fromkeys(params):
+                    cmd += ['-p', param]
+            else:
+                cmd += ['-p', ','.join(dict.fromkeys(params))]
+        if tool_key == 'sqlmap_url':
+            cmd += ['--ignore-redirects', '--timeout=10', '--retries=1']
+            if request_context.get('tokens'):
+                cmd += ['--csrf-token', request_context['tokens'][0],
+                        '--csrf-url', request_context['page']]
 
     return cmd, t
 
@@ -1706,8 +1737,9 @@ _TOOL_NOISE = {
         r'^_+\s*$|^__H__|^___ ___\[|^\|[_\- ]|'   # ASCII art
         r'\{[\d\.]+#\w+\}|'                         # versao tool: {1.10.5#stable}
         r'legal disclaimer|starting @|ending @|'
-        r'\[INFO\]|'
-        r'\[WARNING\]|'
+        r'\[INFO\](?!.*(?:injectable|vulnerable|injection point))|'
+        r'\[WARNING\](?!.*(?:injectable|vulnerable))|'
+        r'all tested parameters do not appear|not injectable|not vulnerable|'
         r'\[CRITICAL\].*(?:timed out|connection|Unable)|'
         r'got a 3\d\d redirect|'
         r'you have not declared cookie|'
@@ -1746,7 +1778,9 @@ def _text_findings(tool_key, otype, lines):
                      'tech_vuln','wordpress'):
         return []  # 'waf' removido — tratado por _parse_wafw00f
     out = []
-    for line in lines[:120]:
+    for line in lines:
+        if len(out) >= 120:
+            break
         l = line.strip()
         if len(l) < 6: continue
         # Rejeitar qualquer resíduo de ANSI mesmo após strip
@@ -2137,7 +2171,9 @@ def _save_tool_output(scan_id, tool_key, raw_target, raw_output):
     except Exception:
         pass   # nunca deixar falha de I/O quebrar o scan
 
-def run_tool_sequential(scan_id, tool_key, raw_target, sid):
+def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None, outcome=None):
+    if outcome is not None:
+        outcome.update(status='skipped', reason='Ferramenta indisponível ou alvo inválido')
     tool = TOOLS.get(tool_key)
     if not tool:
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
@@ -2145,13 +2181,17 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
         return '', []
 
     if not check_binary(tool['binary']):
+        if outcome is not None:
+            outcome['reason'] = f"Binário {tool['binary']} não instalado"
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':f"Binário '{tool['binary']}' não encontrado — apt install {tool['binary']} ou go install"}, room=sid)
         return '', []
 
     proxy = dict(active_proxy)
-    cmd, effective_target = build_cmd(tool_key, raw_target, proxy)
+    cmd, effective_target = build_cmd(tool_key, raw_target, proxy, request_context)
     if cmd is None:
+        if outcome is not None:
+            outcome['reason'] = effective_target
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':effective_target}, room=sid)
         return '', []
@@ -2165,7 +2205,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
     socketio.emit('tool_start', {
         'scan_id': scan_id, 'tool': tool_key,
         'label': tool['label'],
-        'cmd': ' '.join(cmd),
+        'cmd': ' '.join(cmd) if not request_context else f'{tool_key} {effective_target} [contexto GET/POST; valores omitidos]',
         'target': effective_target,
         'proxy': proxy_info,
         'timeout': timeout,
@@ -2219,6 +2259,9 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
         elapsed = round(time.time() - start, 1)
         raw = '\n'.join(output_lines)
         _save_tool_output(scan_id, tool_key, raw_target, raw)
+        if outcome is not None:
+            outcome.update(status='completed' if proc.returncode == 0 and not timed_out['flag'] else 'failed',
+                           exit_code=proc.returncode, timed_out=timed_out['flag'])
         assets, findings = parse_output(tool_key, raw)
         persist_and_emit_findings(scan_id, assets, findings, sid)
         extracted = assets
@@ -2240,8 +2283,125 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
         return raw, extracted
 
     except Exception as e:
+        if outcome is not None:
+            outcome.update(status='failed', reason=str(e))
         socketio.emit('tool_error', {'scan_id':scan_id,'tool':tool_key,'error':str(e)}, room=sid)
         return '', []
+
+def run_adaptive_web(scan_id, targets, sid):
+    scan = active_scans.get(scan_id, {})
+    initial = to_url(scan.get('target', '')) or to_http_url(scan.get('target', ''))
+    report = {'pages': [], 'forms': [], 'tasks': [], 'pending': [], 'errors': [],
+              'limits': {'pages': 12, 'depth': 2, 'jobs': 12}, 'truncated': False,
+              'limitations': ['HTML estático: formulários gerados por JavaScript não são analisados',
+                              'Sem autenticação automática/BF; uploads e fluxos com alteração destrutiva exigem revisão',
+                              'completed indica processo concluído, não ausência de vulnerabilidades']}
+    for key, variable, ceiling in (('pages', 'RECONX_ADAPTIVE_PAGES', 200),
+                                    ('depth', 'RECONX_ADAPTIVE_DEPTH', 5),
+                                    ('jobs', 'RECONX_ADAPTIVE_JOBS', 100)):
+        try:
+            report['limits'][key] = max(1, min(ceiling, int(os.environ.get(variable, report['limits'][key]))))
+        except ValueError:
+            pass
+    results = {}
+    def log(message):
+        socketio.emit('tool_output', {'scan_id': scan_id, 'tool': 'adaptive_web', 'line': message}, room=sid)
+    if not initial or not check_binary('curl'):
+        report['errors'].append({'reason': 'Alvo HTTP inválido ou curl não instalado'})
+        scan['adaptive_report'] = report
+        log('[Adaptive] Descoberta não executada: alvo HTTP inválido ou curl ausente')
+        return {'analysis': {'raw': json.dumps(report, ensure_ascii=False), 'targets': []}}, []
+    with tempfile.TemporaryDirectory(prefix='reconx-web-') as temp:
+        temp = Path(temp)
+        cookie_file = temp / 'cookies.txt'
+        def fetch(url):
+            if scan.get('cancelled'):
+                raise RuntimeError('Scan cancelado')
+            if not scoped_url(initial, url):
+                raise ValueError('URL fora do escopo')
+            proxy = dict(active_proxy)
+            cmd = ['curl', '--silent', '--show-error', '--max-time', '12',
+                   '--max-filesize', '524288', '--dump-header', str(temp / 'headers'),
+                   '--output', str(temp / 'body'), '--cookie', str(cookie_file),
+                   '--cookie-jar', str(cookie_file), url]
+            cmd = inject_proxy(cmd, 'adaptive_web', proxy)
+            response = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                                      env=proxy_env('adaptive_web', proxy))
+            if response.returncode:
+                raise RuntimeError(f'Falha curl ({response.returncode}) ao buscar página')
+            blocks = re.split(r'\r?\n\r?\n', (temp / 'headers').read_text(errors='replace').strip())
+            headers = next((b for b in reversed(blocks) if b.startswith('HTTP/')), '')
+            lines = headers.splitlines()
+            if not lines:
+                raise RuntimeError('Resposta sem cabeçalho HTTP')
+            metadata = dict((k.strip().lower(), v.strip()) for line in lines[1:] if ':' in line
+                            for k, v in [line.split(':', 1)])
+            return {'status': int(lines[0].split()[1]), 'location': metadata.get('location', ''),
+                    'content_type': metadata.get('content-type', ''),
+                    'body': (temp / 'body').read_text(encoding='utf-8', errors='replace')}
+        def cookie_header(url):
+            jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
+            if cookie_file.exists():
+                jar.load(ignore_discard=True)
+            req = urllib.request.Request(url)
+            jar.add_cookie_header(req)
+            return req.get_header('Cookie', '')
+        pages, report['errors'], report['truncated'] = discover(initial, fetch, targets,
+                                                               max_pages=report['limits']['pages'],
+                                                               max_depth=report['limits']['depth'],
+                                                               cancelled=lambda: scan.get('cancelled', False))
+        jobs, report['pending'] = plan_tests(initial, pages, max_jobs=report['limits']['jobs'])
+        report['pages'] = [p.url for p in pages]
+        report['forms'] = [{'page': f['page'], 'action': f['action'], 'method': f['method'],
+                            'login': f['login'], 'fields': [v['name'] for v in f['fields']]}
+                           for p in pages for f in p.forms]
+        log(f"[Adaptive] {len(pages)} páginas, {len(report['forms'])} formulários; {len(jobs)} testes selecionados")
+        if report['truncated']:
+            log('[Adaptive] Há URLs na fila não analisadas: limite de páginas ou cancelamento atingido')
+        report['tasks'] = [{'tool': j['tool'], 'url': j['url'], 'reason': j['reason'], 'status': 'pending'} for j in jobs]
+        for index, job in enumerate(jobs):
+            if scan.get('cancelled'):
+                for pending_task in report['tasks'][index:]:
+                    pending_task.update(status='cancelled', reason='Scan cancelado')
+                break
+            task = report['tasks'][index]
+            context = {'cookie': cookie_header(job['url'])}
+            url = job['url']
+            if job['form']:
+                try:
+                    # Refresh hidden/CSRF values before submitting this form.
+                    response = fetch(job['form']['page'])
+                    if response['status'] != 200:
+                        raise RuntimeError('Página do formulário não acessível ao atualizar tokens')
+                    fresh = parse_page(job['form']['page'], response['body'])
+                    match = next((f for f in fresh.forms if f['action'] == job['form']['action']
+                                  and f['method'] == job['form']['method']
+                                  and [x['name'] for x in f['fields']] == [x['name'] for x in job['form']['fields']]), None)
+                    if not match:
+                        raise RuntimeError('Formulário mudou ou não está mais disponível')
+                    context.update(form_request(match))
+                    url = context['url']
+                    context['cookie'] = cookie_header(url)
+                    if context['tokens'] and job['tool'] == 'dalfox_url':
+                        task.update(status='skipped', reason='XSS com token dinâmico exige renovação por requisição; revisão manual')
+                        log(f"[Adaptive] Pulado: {task['reason']} — {job['url']}")
+                        continue
+                except (ValueError, OSError, RuntimeError) as exc:
+                    task.update(status='skipped', reason=str(exc))
+                    log(f"[Adaptive] Pulado: {task['reason']} — {job['url']}")
+                    continue
+            log(f"[Adaptive] {job['reason']}: {job['tool']} → {job['url']}")
+            raw, extracted = run_tool_sequential(scan_id, job['tool'], url, sid, context, task)
+            results[f"{job['tool']}::{index + 1}"] = {'raw': raw, 'targets': extracted}
+            log(f"[Adaptive] {task['status']}: {job['tool']} — {task.get('reason', job['reason'])}")
+        for error in report['errors']:
+            log(f"[Adaptive] Não analisado: {error['reason']} — {error.get('url', initial)}")
+        for pending in report['pending']:
+            log(f"[Adaptive] Pendente: {pending['reason']} — {pending['url']}")
+    scan['adaptive_report'] = report
+    _scan_output_dir(scan_id).joinpath('adaptive_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    results['analysis'] = {'raw': json.dumps(report, ensure_ascii=False), 'targets': []}
+    return results, []
 
 def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     all_extracted = []
@@ -2269,6 +2429,10 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     for tool_key in tools_to_run:
         if active_scans.get(scan_id, {}).get('cancelled'):
             break
+        if tool_key == 'adaptive_web':
+            adaptive_results, _ = run_adaptive_web(scan_id, target_list, sid)
+            stage_results.update(adaptive_results)
+            continue
         
         wait_time = random.uniform(1.5, 4.2)
         time.sleep(wait_time)
@@ -2297,7 +2461,13 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     return stage_results, unique
 
 def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, intensity='full'):
-    stages = custom_stages if custom_stages else pipeline_def.get('stages', [])
+    stages = list(custom_stages if custom_stages else pipeline_def.get('stages', []))
+    if (intensity == 'full' and pipeline_def.get('label') in
+            ('CTF / HTB Box', 'Web App Pentest', 'Full Pentest', 'Bug Bounty', 'API Pentest')
+            and not any('adaptive_web' in s.get('tools', []) for s in stages)):
+        index = next((i for i, s in enumerate(stages) if s.get('phase') == 'test'), len(stages))
+        stages.insert(index, {'id': 'adaptive', 'name': 'Adaptive Web: formulários e parâmetros',
+                              'phase': 'test', 'tools': ['adaptive_web']})
     all_results = {}
     current_targets = [initial_target]
     all_followups = []
@@ -2368,6 +2538,7 @@ def _finish(scan_id, all_results, target, followups, sid):
                         for k, stage in all_results.items()},
             'manual_followups': list(set(followups)),
             'manual_checklist': MANUAL_CHECKLIST,
+            'adaptive_report': active_scans.get(scan_id, {}).get('adaptive_report'),
             'timestamp': datetime.now().isoformat(),
         }, f, indent=2)
 
@@ -2883,7 +3054,7 @@ def on_start(data):
     pipeline_def = PIPELINES.get(pipeline_key, {})
     active_scans[scan_id] = {
         'processes': {}, 'cancelled': False,
-        'status': 'running', 'target': target, 'sid': sid,
+        'status': 'running', 'target': target, 'sid': sid, 'intensity': data.get('intensity', 'full'),
     }
     db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
                    proxy_status().get('profile', 'none'))
@@ -2976,7 +3147,7 @@ def on_approve(data):
         current = approved
         for i, stage in enumerate(remaining):
             if scan.get('cancelled'): break
-            sr, extracted = run_stage(scan_id, stage, current, sid)
+            sr, extracted = run_stage(scan_id, stage, current, sid, scan.get('intensity', 'full'))
             all_results[stage['id']] = sr
             for tk in stage['tools']:
                 all_followups.extend(TOOLS.get(tk, {}).get('manual_followup', []))
