@@ -162,7 +162,12 @@ def db_summary(scan_id):
         total = c.execute("SELECT COUNT(*) n FROM findings WHERE scan_id=?", (scan_id,)).fetchone()['n']
     return {'severity': sev, 'assets': atypes, 'total': total}
 
-db_init()
+try:
+    db_init()
+except sqlite3.OperationalError as exc:
+    if 'readonly database' in str(exc).lower():
+        raise SystemExit('Banco de resultados sem permissão de escrita. Inicie com: sudo /usr/local/bin/reconx') from None
+    raise
 host_store = HostStore(DB_PATH)
 host_store.init()
 

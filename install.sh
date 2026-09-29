@@ -395,6 +395,14 @@ python3 app.py "$@"
 RCEOF
 chmod +x /usr/local/bin/reconx
 
+# O secure_path do sudo em algumas distros não inclui /usr/local/bin.
+# Cria um alias no PATH padrão sem substituir um comando já existente.
+if [[ ! -e /usr/bin/reconx && ! -L /usr/bin/reconx ]]; then
+    ln -s /usr/local/bin/reconx /usr/bin/reconx
+elif [[ "$(readlink -f /usr/bin/reconx)" != /usr/local/bin/reconx ]]; then
+    warn "/usr/bin/reconx já pertence a outro programa; use sudo /usr/local/bin/reconx"
+fi
+
 # Alias no zshrc
 if [[ -f /root/.zshrc ]] && ! grep -q 'alias reconx=' /root/.zshrc; then
     echo "alias reconx='sudo /usr/local/bin/reconx'" >> /root/.zshrc
@@ -412,8 +420,8 @@ echo -e "${BOLD}${GREEN}══════════════════�
 echo -e "${BOLD}${GREEN}  ReconX v5 instalado com sucesso!${NC}"
 echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Iniciar:   ${YELLOW}reconx${NC}  ou  ${YELLOW}sudo python3 $APP_DIR/app.py${NC}"
-echo -e "  Expor LAN: ${YELLOW}reconx --expose${NC}  (bind 0.0.0.0 — use com cautela)"
+echo -e "  Iniciar:   ${YELLOW}sudo reconx${NC}  (fallback: sudo /usr/local/bin/reconx)"
+echo -e "  Expor LAN: ${YELLOW}sudo reconx --expose${NC}  (bind 0.0.0.0 — use com cautela)"
 echo -e "  Interface: ${CYAN}http://localhost:5000${NC}"
 echo -e "  Atualizar: ${YELLOW}sudo bash $APP_DIR/update.sh${NC}"
 echo -e "  Relatório: ${CYAN}http://localhost:5000/api/report/<scan_id>${NC} (Markdown)"

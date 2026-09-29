@@ -145,6 +145,14 @@ if (( SERVICE_ACTIVE )); then
 fi
 SUCCESS=1
 say "Atualização aplicada: $LATEST"
+# Instalações antigas podem não ter o alias visível no secure_path do sudo.
+if [[ -x /usr/local/bin/reconx && ! -e /usr/bin/reconx && ! -L /usr/bin/reconx ]]; then
+    if ln -s /usr/local/bin/reconx /usr/bin/reconx; then
+        say 'Comando sudo reconx disponível em /usr/bin/reconx'
+    else
+        say 'Não foi possível criar /usr/bin/reconx; use sudo /usr/local/bin/reconx'
+    fi
+fi
 say "Backup: $BACKUP_DIR/app"
 say "Resultados preservados em $ROOT_DIR/results"
 (( SERVICE_ACTIVE )) || say 'Inicie novamente com: reconx'
