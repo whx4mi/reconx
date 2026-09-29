@@ -9,9 +9,8 @@ ReconX v5 — Proxy Layer + Maximum Coverage + Robustez
 Novidades v5:
 - Timeout por ferramenta com watchdog (nenhuma tool trava o pipeline)
 - Bind em 127.0.0.1 por padrão (--expose para 0.0.0.0); CLI via argparse
-- proxy_env respeita proxy_support por tool (passivas não floodam o Burp;
-  perfil Tor força tudo para anonimato)
-- Nmap usa connect scan (-sT) quando há proxy HTTP + aviso de limitação
+- Proxy indisponível ou ferramenta incompatível bloqueia a execução
+- Nmap é bloqueado com proxy: --proxies não cobre o port scan
 - SECRET_KEY randômica; correção do conflito --random-agent/--user-agent no sqlmap
 - Novas tools: nmap_vuln (NSE), gowitness, arjun, testssl, gobuster_vhost,
   nuclei_takeover, nuclei_dast
@@ -23,6 +22,7 @@ import subprocess, threading, os, json, uuid, shutil, time, re, socket, secrets,
 from datetime import datetime
 from pathlib import Path
 import random
+from urllib.parse import urlsplit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('RECONX_SECRET') or secrets.token_hex(16)
@@ -228,26 +228,52 @@ def get_proxy_socks():
 def check_proxy_alive(host, port):
     """Verifica se o proxy está aceitando conexões."""
     try:
-        s = socket.socket()
-        s.settimeout(2)
-        s.connect((host, int(port)))
-        s.close()
+        with socket.create_connection((host, int(port)), timeout=2):
+            pass
         return True
-    except:
+    except (OSError, ValueError, TypeError):
         return False
 
-def _proxy_url_if_alive():
-    """Retorna o proxy URL ativo SÓ se o endpoint estiver acessível (TCP check 2s).
-    Se o proxy está configurado mas down, retorna None para que inject_proxy
-    não injete flags de proxy inacessível nas tools."""
-    http  = get_proxy_http()
-    socks = get_proxy_socks()
-    url   = http or socks
+def _proxy_url_if_alive(proxy=None):
+    """Valida o perfil completo; proxy inválido/down nunca vira conexão direta."""
+    proxy = dict(active_proxy) if proxy is None else proxy
+    http, socks = proxy.get('http'), proxy.get('socks')
+    if proxy.get('profile', 'none') == 'none' and not (http or socks):
+        return None
+    if not (http or socks):
+        raise ValueError('Proxy selecionado sem endereço. Configure-o ou selecione Sem proxy.')
+    for address, schemes in ((http, ('http', 'https')), (socks, ('socks5', 'socks5h'))):
+        if not address:
+            continue
+        try:
+            parsed = urlsplit(address)
+            if (parsed.scheme not in schemes or not parsed.hostname or not parsed.port
+                    or parsed.path not in ('', '/') or parsed.query or parsed.fragment
+                    or any(c.isspace() for c in address)):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError('Endereço de proxy inválido; informe esquema, host e porta.') from None
+        if not check_proxy_alive(parsed.hostname, parsed.port):
+            raise ValueError('Proxy inacessível. Execução bloqueada; inicie o serviço ou selecione Sem proxy.')
+    return http or socks
+
+def _tool_proxy_url(tool_key, proxy):
+    url = _proxy_url_if_alive(proxy)
     if not url:
         return None
-    m = re.match(r'(?:socks5?h?|https?)://([^:/]+):(\d+)', url)
-    if m and not check_proxy_alive(m.group(1), m.group(2)):
-        return None   # proxy configurado mas inacessível
+    tool = TOOLS.get(tool_key, {})
+    binary = Path(tool.get('binary', '')).name
+    # --proxies do Nmap não cobre o port scan; env vars não cobrem raw sockets/DNS.
+    if not tool.get('proxy_support') or binary == 'nmap':
+        raise ValueError('Ferramenta sem roteamento completo por proxy; execução bloqueada. Para o lab local, selecione Sem proxy.')
+    supported = {'curl', 'wget', 'sqlmap', 'ffuf', 'gobuster', 'nikto', 'nuclei',
+                 'httpx', 'dalfox', 'whatweb', 'wpscan', 'feroxbuster', 'katana',
+                 'commix', 'arjun', 'wafw00f', 'gowitness', 'testssl.sh', 'testssl',
+                 'nomore403', 'corsy'}
+    if binary not in supported:
+        raise ValueError('Roteamento por proxy não implementado para esta ferramenta; execução bloqueada.')
+    if binary in {'arjun', 'testssl.sh', 'testssl'} and not proxy.get('http'):
+        raise ValueError('Esta ferramenta requer proxy HTTP; execução bloqueada para SOCKS.')
     return url
 
 def proxy_status():
@@ -258,11 +284,11 @@ def proxy_status():
 
     http = active_proxy.get("http")
     socks = active_proxy.get("socks")
-    addr = http or socks or ""
-    m = re.match(r'https?://([^:/]+):(\d+)', addr)
-    reachable = False
-    if m:
-        reachable = check_proxy_alive(m.group(1), m.group(2))
+    try:
+        _proxy_url_if_alive(dict(active_proxy))
+        reachable = True
+    except ValueError:
+        reachable = False
 
     return {
         "active": True,
@@ -349,14 +375,14 @@ def to_http_url(raw):
 # PROXY INJECTION — como cada tool recebe o proxy
 # ══════════════════════════════════════════════════════════════════════════════
 
-def inject_proxy(cmd: list, tool_key: str) -> list:
+def inject_proxy(cmd: list, tool_key: str, proxy=None) -> list:
     """
     Adiciona flags de proxy e User-Agent específicas de cada tool.
     Aplica rotação de UA mesmo sem proxy para aumentar o stealth.
     """
-    http      = get_proxy_http()
-    socks     = get_proxy_socks()
-    proxy_url = _proxy_url_if_alive()   # None se proxy configurado mas inacessível
+    proxy = dict(active_proxy) if proxy is None else proxy
+    http = proxy.get('http')
+    proxy_url = _tool_proxy_url(tool_key, proxy)
     ua = random.choice(USER_AGENTS)
 
     # Mapa: prefixo do binário -> como injetar (Proxy, User-Agent)
@@ -364,10 +390,8 @@ def inject_proxy(cmd: list, tool_key: str) -> list:
     rules = {
         "curl":         lambda c: (c + ["-x", proxy_url] if proxy_url else c) + ["-H", f"User-Agent: {ua}"],
         "wget":         lambda c: (c + [f"--execute=http_proxy={proxy_url}", f"--execute=https_proxy={proxy_url}"] if proxy_url else c) + [f"--user-agent={ua}"],
-        # Nmap: --proxies só funciona em connect scan (-sT) e apenas com proxy HTTP.
-        # SYN scan e UDP NÃO são roteáveis por proxy HTTP — por isso forçamos -sT/-Pn.
-        # SOCKS5 (ex.: Tor) não é suportado por --proxies; nesse caso não injeta.
-        "nmap":         lambda c: (c + ["-sT", "-Pn", "--proxies", http] if http else c),
+        # Bloqueado por _tool_proxy_url quando um proxy está selecionado.
+        "nmap":         lambda c: c,
         # sqlmap: o template já traz --random-agent; injetar --user-agent geraria
         # conflito. Quando há proxy, só adicionamos a flag de proxy.
         "sqlmap":       lambda c: (c + ["--proxy", proxy_url] if proxy_url else c),
@@ -414,26 +438,23 @@ def inject_proxy(cmd: list, tool_key: str) -> list:
 
     return cmd  # tool desconhecida — retorna sem modificar
 
-def proxy_env(tool_key=None) -> dict:
+def proxy_env(tool_key=None, proxy=None) -> dict:
     """
-    Monta o ambiente de execução. As variáveis HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
-    só são injetadas quando fazem sentido:
-      - Perfil Tor: SEMPRE injeta (garante anonimato, evita leaks de DNS/HTTP).
-      - Demais perfis (Burp/ZAP/custom): só injeta para tools com proxy_support=True,
-        evitando que coletoras passivas (subfinder/gau/waybackurls) floodem o proxy
-        de interceptação com requests a dezenas de APIs externas.
+    Monta o ambiente usando o mesmo perfil dos argumentos. Remove proxies
+    herdados e NO_PROXY para que o ambiente não contorne o perfil selecionado.
+    Ferramentas incompatíveis são bloqueadas antes de criar o subprocesso.
     """
+    proxy = dict(active_proxy) if proxy is None else proxy
     env = EXEC_ENV.copy()
+    for key in list(env):
+        if key.lower() in {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}:
+            del env[key]
     env['HTTP_USER_AGENT'] = random.choice(USER_AGENTS)
-
-    profile = active_proxy.get('profile', 'none')
-    tool = TOOLS.get(tool_key, {}) if tool_key else {}
-    use_env = (profile == 'tor') or tool.get('proxy_support', False)
-    if not use_env:
+    if not _tool_proxy_url(tool_key, proxy):
         return env
 
-    http = get_proxy_http()
-    socks = get_proxy_socks()
+    http = proxy.get('http')
+    socks = proxy.get('socks')
     if http:
         env['HTTP_PROXY']  = http
         env['HTTPS_PROXY'] = http
@@ -1381,7 +1402,7 @@ active_scans = {}
 def check_binary(binary):
     return bool(shutil.which(binary))
 
-def build_cmd(tool_key, raw_target):
+def build_cmd(tool_key, raw_target, proxy=None):
     tool = TOOLS[tool_key]
     template = tool['cmd'][:]
     input_type = tool['input']
@@ -1415,7 +1436,10 @@ def build_cmd(tool_key, raw_target):
             return None, f"Wordlist não encontrada: {part}"
 
     # Injeta proxy
-    cmd = inject_proxy(cmd, tool_key)
+    try:
+        cmd = inject_proxy(cmd, tool_key, proxy)
+    except ValueError as e:
+        return None, str(e)
 
     return cmd, t
 
@@ -1895,6 +1919,9 @@ def run_verification(finding):
     Retorna dict: {ok, verified, tool, cmd, output, returncode, error?, confidence?}
     NUNCA usa shell=True. Timeout e truncamento aplicados.
     """
+    proxy = dict(active_proxy)
+    if proxy.get('profile', 'none') != 'none' or proxy.get('http') or proxy.get('socks'):
+        return {'ok': False, 'error': 'Verificação ativa sem suporte a proxy; execução bloqueada. Para o lab local, selecione Sem proxy.'}
     entry = match_verifier(finding)
     if not entry:
         return {'ok': False, 'error': 'Nenhum verificador disponivel para este finding'}
@@ -1929,7 +1956,7 @@ def run_verification(finding):
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=VERIFY_TIMEOUT, env=EXEC_ENV,
+            timeout=VERIFY_TIMEOUT, env=proxy_env(proxy=proxy),
         )
         out = strip_ansi((result.stdout or '') + (result.stderr or ''))
         out = out.strip()[:VERIFY_MAX_OUTPUT]
@@ -2122,30 +2149,18 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
             'reason':f"Binário '{tool['binary']}' não encontrado — apt install {tool['binary']} ou go install"}, room=sid)
         return '', []
 
-    cmd, effective_target = build_cmd(tool_key, raw_target)
+    proxy = dict(active_proxy)
+    cmd, effective_target = build_cmd(tool_key, raw_target, proxy)
     if cmd is None:
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':effective_target}, room=sid)
         return '', []
 
     proxy_info = ""
-    _proxy_down_warn = False
-    if get_proxy_http() or get_proxy_socks():
-        if _proxy_url_if_alive():
-            proxy_info = f" [via {active_proxy.get('profile','proxy')}]"
-        else:
-            _proxy_down_warn = True
-            proxy_info = f" [proxy {active_proxy.get('profile','?')} INACESSÍVEL — direto]"
+    if proxy.get('http') or proxy.get('socks'):
+        proxy_info = f" [via {proxy.get('profile','proxy')}]"
 
     timeout = tool.get('timeout', DEFAULT_TOOL_TIMEOUT)
-
-    if _proxy_down_warn:
-        socketio.emit('tool_output', {
-            'scan_id': scan_id, 'tool': tool_key,
-            'line': f"[!] Proxy {active_proxy.get('profile','?')} inacessível"
-                    f" ({get_proxy_http() or get_proxy_socks()}) — "
-                    f"{tool_key} vai rodar SEM proxy (verifique se Tor/Privoxy está ativo)"
-        }, room=sid)
 
     socketio.emit('tool_start', {
         'scan_id': scan_id, 'tool': tool_key,
@@ -2166,7 +2181,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            env=proxy_env(tool_key),
+            env=proxy_env(tool_key, proxy),
             cwd='/tmp',
         )
         if scan_id in active_scans:
@@ -2441,8 +2456,12 @@ def api_retest(scan_id, finding_id):
         return jsonify({'error': f'Tool desconhecida: {tool_key}'}), 400
     t = TOOLS[tool_key]
     try:
-        cmd = build_cmd(tool_key, target)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proxy = dict(active_proxy)
+        cmd, reason = build_cmd(tool_key, target, proxy)
+        if cmd is None:
+            return jsonify({'error': reason}), 400
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                env=proxy_env(tool_key, proxy))
         return jsonify({
             'scan_id': scan_id, 'finding_id': finding_id,
             'tool': tool_key, 'target': target,
@@ -2828,6 +2847,7 @@ def on_connect():
 
 @socketio.on('set_proxy')
 def on_set_proxy(data):
+    global active_proxy
     profile = data.get('profile', 'none')
     custom_http  = data.get('custom_http')
     custom_socks = data.get('custom_socks')
@@ -2836,9 +2856,9 @@ def on_set_proxy(data):
         emit('proxy_error', {'message': f'Perfil desconhecido: {profile}'}); return
 
     p = PROXY_PROFILES[profile]
-    active_proxy['profile'] = profile
-    active_proxy['http']  = custom_http  if profile == 'custom' else p.get('http')
-    active_proxy['socks'] = custom_socks if profile == 'custom' else p.get('socks')
+    active_proxy = {'profile': profile,
+                    'http': custom_http if profile == 'custom' else p.get('http'),
+                    'socks': custom_socks if profile == 'custom' else p.get('socks')}
 
     status = proxy_status()
     emit('proxy_set', status)
@@ -2881,7 +2901,7 @@ def on_start(data):
         emit('proxy_warning', {
             'message': (f"Proxy {pstat.get('label', pstat.get('profile'))} ativo mas "
                         f"INACESSÍVEL ({pstat.get('http') or pstat.get('socks')}). "
-                        f"As ferramentas vão falhar. Inicie o serviço "
+                        f"As ferramentas serão bloqueadas. Inicie o serviço "
                         f"(ex.: sudo service tor start && sudo service privoxy start) "
                         f"ou troque para 'Sem proxy'."),
             'profile': pstat.get('profile'),
