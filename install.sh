@@ -123,6 +123,7 @@ cp "$SCRIPT_DIR/ai_pipeline.py"           "$APP_DIR/ai_pipeline.py"
 cp "$SCRIPT_DIR/gemini_client.py"         "$APP_DIR/gemini_client.py"
 cp "$SCRIPT_DIR/host_profiles.py"         "$APP_DIR/host_profiles.py"
 cp "$SCRIPT_DIR/templates/index.html"     "$APP_DIR/templates/index.html"
+cp "$SCRIPT_DIR/templates/host.html"      "$APP_DIR/templates/host.html"
 if [[ -f "$SCRIPT_DIR/update.sh" ]]; then
     cp "$SCRIPT_DIR/update.sh" "$APP_DIR/update.sh"
     chmod +x "$APP_DIR/update.sh"

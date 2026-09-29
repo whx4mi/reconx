@@ -565,12 +565,9 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
   <!-- COVERAGE PANEL -->
   <div class="panel" id="panel-hosts">
     <div class="cov-wrap">
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
-        <button class="btn btn-g" onclick="createHostFromTarget()">Adicionar alvo atual</button>
-        <span style="font-size:10px;color:var(--mu2)">Perfis, histórico e checklist persistidos por host.</span>
-      </div>
+      <h2 style="margin:0 0 8px">Hosts escaneados</h2>
+      <div style="font-size:11px;color:var(--mu2);margin-bottom:14px">Selecione um host para abrir seu perfil em outra aba, com resultados e próximas ações.</div>
       <div id="host-list" style="margin-bottom:16px"></div>
-      <div id="host-detail"></div>
     </div>
   </div>
 
@@ -689,7 +686,6 @@ const S = {
   followups: [], checkProgress: {},
   proxyShown: false, selectedProxy: 'none',
   findings: [], findSummary: null, actionItems: null,
-  hostId: null,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -715,7 +711,6 @@ socket.on('proxy_warning', d => {
 });
 
 socket.on('pipeline_started', d => {
-  S.hostId = d.host_id || null;
   loadHosts();
   S.scanId = d.scan_id; S.lastScanId = d.scan_id; S.running = true; S.total = 0; S.done = 0;
   S.findings = []; S.findSummary = null; S.actionItems = null; renderFindings(); updateFindBadge();
@@ -1659,104 +1654,17 @@ function escH(s) {
 async function loadHosts() {
   const list = document.getElementById('host-list');
   try {
-    const response = await fetch('/api/hosts');
+    const response = await fetch('/api/hosts?scanned=1');
     if (!response.ok) throw new Error('Falha ao carregar hosts');
     const hosts = await response.json();
-    list.innerHTML = hosts.length ? hosts.map(h =>
-      `<button class="btn btn-gh" style="margin:3px" data-host-id="${h.id}">${escH(h.host)} · ${h.scan_count} scans · ${h.run_count} execuções</button>`
-    ).join('') : '<div class="empty">Nenhum host cadastrado. Adicione um alvo ou inicie uma scan.</div>';
-    list.querySelectorAll('[data-host-id]').forEach(btn =>
-      btn.addEventListener('click', () => openHost(Number(btn.dataset.hostId))));
-    if (S.hostId && hosts.some(h => h.id === S.hostId)) await openHost(S.hostId);
+    list.innerHTML = hosts.length ? hosts.map(h => `
+      <a href="/hosts/${Number(h.id)}" target="_blank" rel="noopener" style="display:block;padding:13px 15px;margin:7px 0;border:1px solid var(--mu);border-radius:8px;text-decoration:none;color:inherit">
+        <div style="font-size:14px;color:var(--g);font-weight:700">${escH(h.host)} <span style="float:right;font-size:10px;color:var(--mu2)">Abrir perfil ↗</span></div>
+        <div style="font-size:10px;color:var(--mu2);margin-top:6px">${Number(h.scan_count)} scans · ${Number(h.run_count)} execuções · atualizado ${escH(h.updated_at || '')}</div>
+      </a>`).join('') : '<div class="empty">Nenhum host escaneado ainda. Inicie uma scan para criar o primeiro perfil.</div>';
   } catch (error) {
     list.textContent = error.message;
   }
-}
-
-async function createHostFromTarget() {
-  const target = document.getElementById('tgt').value.trim();
-  if (!target) { toast('Informe um host ou URL no campo Alvo', 'warn'); return; }
-  const response = await fetch('/api/hosts', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body:JSON.stringify({target})});
-  const profile = await response.json();
-  if (!response.ok) { toast(profile.error || 'Host inválido', 'warn'); return; }
-  S.hostId = profile.id;
-  await loadHosts();
-}
-
-async function openHost(id) {
-  const response = await fetch(`/api/hosts/${id}`);
-  if (!response.ok) { toast('Perfil não encontrado', 'warn'); return; }
-  const p = await response.json();
-  S.hostId = id;
-  const detail = document.getElementById('host-detail');
-  detail.innerHTML = `
-    <h3 style="margin:8px 0">${escH(p.host)}</h3>
-    <div style="font-size:10px;color:var(--g);margin-bottom:5px">Etapa sugerida: ${escH(({recon_inicial:'Recon inicial',recon_segmentado:'Recon segmentado',revisao_manual:'Recon + revisão manual'})[p.phase] || p.phase)}</div>
-    <div style="font-size:10px;color:var(--mu2);margin-bottom:14px">Cada execução e evidência pertence a este host. “Concluída” significa que a ferramenta terminou, não que a categoria foi validada.</div>
-    <h4>Próximas etapas</h4>
-    <div id="host-suggestions" style="margin:8px 0 18px"></div>
-    <h4>Scans (${p.scans.length})</h4>
-    <div style="font-size:10px;margin:8px 0 18px">${p.scans.length ? p.scans.map(s =>
-      `<div>${escH(s.started_at || '')} · ${escH(s.pipeline || '')} · ${escH(s.status || '')} · <a href="/api/results/${encodeURIComponent(s.scan_id)}" target="_blank" rel="noopener">${escH(s.scan_id)}</a></div>`
-    ).join('') : 'Nenhuma scan executada neste host.'}</div>
-    <h4>Ativos observados (${p.assets.length})</h4>
-    <div style="font-size:10px;max-height:120px;overflow:auto;margin:8px 0 18px">${p.assets.length ? p.assets.map(a =>
-      `<div>${escH(a.atype)} · ${escH(a.value)}</div>`).join('') : 'Nenhum ativo associado.'}</div>
-    <h4>Serviços observados (${p.services.length})</h4>
-    <div style="font-size:10px;max-height:120px;overflow:auto;margin:8px 0 18px">${p.services.length ? p.services.map(s =>
-      `<div>${s.port}/${escH(s.protocol)} · ${escH(s.service)} · scan ${escH(s.scan_id)}</div>`).join('') : 'Nenhum serviço associado.'}</div>
-    <h4>Execuções recentes (${p.runs.length})</h4>
-    <div style="font-size:10px;max-height:180px;overflow:auto;margin:8px 0 18px">${p.runs.length ? p.runs.map(r =>
-      `<div>${escH(r.created_at)} · ${escH(r.tool)} · ${escH(r.status)} · ${escH(r.target)} · scan ${escH(r.scan_id)}${r.output_path ? ` · <a href="/api/hosts/${p.id}/runs/${r.id}/output" target="_blank" rel="noopener">ver output</a>` : ''}</div>`
-    ).join('') : 'Nenhuma ferramenta executada neste host.'}</div>
-    <h4>Checklist manual</h4>
-    <div style="font-size:10px;color:var(--mu2);margin:6px 0">Para marcar “testado”, inclua uma referência de evidência. Não cole segredos aqui; dados são armazenados no SQLite local.</div>
-    <div id="host-checks"></div>`;
-  const suggestions = detail.querySelector('#host-suggestions');
-  suggestions.innerHTML = p.suggestions.map(s =>
-    `<button class="btn ${s.ready ? 'btn-g' : 'btn-gh'}" style="margin:3px" data-pipeline="${escH(s.key)}" ${s.ready ? '' : 'disabled'} title="${escH(s.reason)}">${escH(PIPELINES[s.key]?.label || s.key)} · ${escH(s.reason)}</button>`
-  ).join('');
-  suggestions.querySelectorAll('[data-pipeline]').forEach(btn => btn.addEventListener('click', () => {
-    const key = btn.dataset.pipeline;
-    const service = p.services.find(s => /http|ssl/i.test(s.service) ||
-      [80,443,8000,8008,8080,8081,8443,8888,3000,5000].includes(s.port));
-    const scheme = service && (service.port === 443 || service.port === 8443 || /https|ssl/i.test(service.service)) ? 'https' : 'http';
-    const base = service ? `${scheme}://${p.host.includes(':') ? `[${p.host}]` : p.host}:${service.port}` : `http://${p.host}`;
-    const api = p.assets.find(a => /\/(?:api|graphql|swagger|openapi)(?:\/|\b)/i.test(a.value));
-    const target = key === 'host_recon' ? p.host :
-      (key === 'api_recon' && api ? (api.value.startsWith('http') ? api.value : base + api.value) : base);
-    document.getElementById('tgt').value = target;
-    selectPreset(key);
-    toast('Pipeline selecionado; revise escopo e inicie quando autorizado', 'ok');
-  }));
-  const checks = detail.querySelector('#host-checks');
-  checks.innerHTML = p.checks.map(c => `
-    <div class="sb-sec" style="padding:9px;margin:6px 0" data-check="${escH(c.check_key)}">
-      <div style="font-size:11px;margin-bottom:5px">${escH(c.label)}</div>
-      <select class="proxy-input check-status">
-        ${[['pending','Pendente'],['in_progress','Em andamento'],['tested','Testado'],['inconclusive','Inconclusivo'],['not_applicable','Não aplicável']].map(([value,label]) =>
-          `<option value="${value}" ${value === c.status ? 'selected' : ''}>${label}</option>`).join('')}
-      </select>
-      <textarea class="proxy-input check-note" rows="2" maxlength="2000" placeholder="Observação">${escH(c.note || '')}</textarea>
-      <textarea class="proxy-input check-evidence" rows="2" maxlength="2000" placeholder="Referência de evidência (scan, request, arquivo local)">${escH(c.evidence || '')}</textarea>
-      <button class="btn btn-g check-save">Salvar</button>
-    </div>`).join('');
-  checks.querySelectorAll('[data-check]').forEach(row => row.querySelector('.check-save').addEventListener('click',
-    () => saveHostCheck(p.id, row)));
-}
-
-async function saveHostCheck(hostId, row) {
-  const key = row.dataset.check;
-  const response = await fetch(`/api/hosts/${hostId}/checks/${encodeURIComponent(key)}`, {
-    method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
-      status:row.querySelector('.check-status').value,
-      note:row.querySelector('.check-note').value,
-      evidence:row.querySelector('.check-evidence').value,
-    })
-  });
-  const result = await response.json();
-  toast(response.ok ? 'Checklist salvo neste host' : (result.error || 'Não foi possível salvar'), response.ok ? 'ok' : 'warn');
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1773,6 +1681,14 @@ renderAddSelect();
 renderChecklist();
 loadResults();
 loadHosts();
+const initialSelection = new URLSearchParams(window.location.search);
+const suggestedPipeline = initialSelection.get('pipeline');
+const suggestedTarget = initialSelection.get('target');
+if (suggestedTarget && suggestedPipeline && PIPELINES[suggestedPipeline]?.profile_segmented) {
+  document.getElementById('tgt').value = suggestedTarget;
+  selectPreset(suggestedPipeline);
+  toast('Alvo e pipeline preparados; revise o escopo antes de iniciar', 'ok');
+}
 </script>
 </body>
 </html>

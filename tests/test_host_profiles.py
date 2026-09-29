@@ -16,6 +16,9 @@ class HostProfilesTests(unittest.TestCase):
             with con:
                 con.execute('''CREATE TABLE scans(scan_id TEXT PRIMARY KEY,target TEXT,pipeline TEXT,
                                proxy TEXT,status TEXT,started_at TEXT,finished_at TEXT)''')
+                con.execute('''CREATE TABLE findings(id INTEGER PRIMARY KEY,scan_id TEXT,tool TEXT,
+                    ftype TEXT,name TEXT,severity TEXT,target TEXT,evidence TEXT,
+                    confidence TEXT,created_at TEXT)''')
         self.store = Store(path)
         self.store.init()
 
@@ -91,6 +94,23 @@ class HostProfilesTests(unittest.TestCase):
                                    '{"url":"https://second.example:8443/login"}')
         self.assertFalse(self.store.get(first)['services'])
         self.assertEqual(self.store.get(second)['services'][0]['port'], 8443)
+
+    def test_scanned_list_and_findings_do_not_leak_between_hosts(self):
+        first = self.store.ensure('first.example', 'scan-1')
+        second = self.store.ensure('second.example', 'scan-1')
+        unscanned = self.store.ensure('unscanned.example')
+        with closing(sqlite3.connect(self.store.path)) as con:
+            with con:
+                con.execute("INSERT INTO scans(scan_id,target) VALUES('scan-1','first.example')")
+                con.execute("""INSERT INTO findings
+                    (scan_id,tool,ftype,name,severity,target,evidence,confidence,created_at)
+                    VALUES('scan-1','httpx','http','first','info','https://first.example/a','','possible','now'),
+                    ('scan-1','httpx','http','second','high','https://second.example/b','','possible','now'),
+                    ('scan-1','nmap','port','unknown','info','','','possible','now')""")
+        self.assertEqual({h['id'] for h in self.store.list_hosts(scanned_only=True)}, {first, second})
+        self.assertNotIn(unscanned, {h['id'] for h in self.store.list_hosts(scanned_only=True)})
+        self.assertEqual([f['name'] for f in self.store.get(first)['findings']], ['first'])
+        self.assertEqual([f['name'] for f in self.store.get(second)['findings']], ['second'])
 
 
 if __name__ == '__main__':

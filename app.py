@@ -2787,6 +2787,12 @@ def index():
         manual_checklist_json=_safe_js_json(MANUAL_CHECKLIST),
     )
 
+@app.route('/hosts/<int:host_id>')
+def host_page(host_id):
+    if not host_store.get(host_id):
+        return 'Host não encontrado', 404
+    return render_template('host.html', host_id=host_id)
+
 @app.route('/api/proxy/status')
 def api_proxy_status():
     return jsonify(proxy_status())
@@ -2794,7 +2800,7 @@ def api_proxy_status():
 @app.route('/api/hosts', methods=['GET', 'POST'])
 def api_hosts():
     if request.method == 'GET':
-        return jsonify(host_store.list_hosts())
+        return jsonify(host_store.list_hosts(scanned_only=request.args.get('scanned') == '1'))
     data = request.get_json(silent=True) or {}
     try:
         host_id = host_store.ensure(data.get('target'))

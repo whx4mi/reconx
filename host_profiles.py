@@ -196,12 +196,14 @@ class Store:
                     (host_id,port,protocol,service,scan_id) VALUES(?,?,?,?,?)''',
                     (host_id, port, protocol, str(service or '')[:80], scan_id))
 
-    def list_hosts(self):
+    def list_hosts(self, scanned_only=False):
         with self.lock, self._db() as con:
             return [dict(row) for row in con.execute('''SELECT h.id,h.host,h.created_at,h.updated_at,
                 (SELECT COUNT(*) FROM host_scans s WHERE s.host_id=h.id) scan_count,
                 (SELECT COUNT(*) FROM host_runs r WHERE r.host_id=h.id) run_count
-                FROM host_profiles h ORDER BY h.updated_at DESC''')]
+                FROM host_profiles h
+                WHERE (?=0 OR EXISTS (SELECT 1 FROM host_scans s WHERE s.host_id=h.id))
+                ORDER BY h.updated_at DESC''', (int(scanned_only),))]
 
     def get_run(self, host_id, run_id):
         with self.lock, self._db() as con:
@@ -227,6 +229,20 @@ class Store:
                 WHERE host_id=? ORDER BY atype,value LIMIT 200''', (host_id,))]
             services = [dict(row) for row in con.execute('''SELECT port,protocol,service,scan_id
                 FROM host_services WHERE host_id=? ORDER BY port LIMIT 200''', (host_id,))]
+            # Só atribui findings com um host explícito; scans podem pivotar para outros alvos.
+            findings = []
+            if con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='findings'").fetchone():
+                for row in con.execute('''SELECT f.id,f.scan_id,f.tool,f.ftype,f.name,f.severity,
+                    f.target,f.evidence,f.confidence,f.created_at FROM findings f
+                    JOIN host_scans hs ON hs.scan_id=f.scan_id WHERE hs.host_id=?
+                    ORDER BY f.id DESC LIMIT 500''', (host_id,)):
+                    try:
+                        if canonical_host(row['target']) == host['host']:
+                            findings.append(dict(row))
+                    except ValueError:
+                        continue
+                    if len(findings) >= 200:
+                        break
             complete = {r['tool'] for r in runs if r['status'] == 'completed'}
             web = any(a['atype'] in ('url', 'path') for a in assets) or any(
                 s['port'] in (80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 3000, 5000)
@@ -245,9 +261,30 @@ class Store:
                 {'key': 'api_recon', 'ready': recon and api,
                  'reason': 'Rota/API observada no inventário' if recon and api else 'Aguardando rota/API observada'},
             ]
+            recommendations = []
+            if not recon:
+                recommendations.append({'title': 'Executar recon inicial',
+                    'reason': 'Ainda não há execução de reconhecimento concluída para este host.',
+                    'pipeline': 'host_recon'})
+            if recon and web:
+                recommendations.append({'title': 'Mapear a superfície web',
+                    'reason': 'Serviço ou rota HTTP observada; revise porta e URL antes de executar.',
+                    'pipeline': 'web_recon'})
+            if recon and api:
+                recommendations.append({'title': 'Inventariar endpoints de API',
+                    'reason': 'Há indício de rota ou documentação de API neste host.',
+                    'pipeline': 'api_recon'})
+            if any(f['severity'] in ('critical', 'high') for f in findings):
+                recommendations.append({'title': 'Validar achados prioritários',
+                    'reason': 'Achados críticos/altos exigem reprodução e revisão de falso positivo.',
+                    'pipeline': None})
+            if any(c['status'] in ('pending', 'inconclusive') for c in checks):
+                recommendations.append({'title': 'Revisar checklist manual',
+                    'reason': 'Há itens pendentes ou inconclusivos; registre evidência por host.',
+                    'pipeline': None})
             return {**dict(host), 'scans': scans, 'runs': runs, 'checks': checks,
-                    'assets': assets, 'services': services, 'suggestions': suggestions,
-                    'phase': phase}
+                    'assets': assets, 'services': services, 'findings': findings,
+                    'suggestions': suggestions, 'recommendations': recommendations, 'phase': phase}
 
     def update_check(self, host_id, key, status, note, evidence):
         if key not in CHECKS or status not in STATUSES:

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReconX · Perfil do host</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b1018;--surface:#141d29;--line:#2b394a;--text:#e9f2f5;--muted:#a6b7c3;--green:#51e5b0;--amber:#ffcc74;--red:#ff7087}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+    a{color:var(--green)}button,select,textarea{font:inherit}button,.action{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:#1b2a38;color:var(--text);padding:8px 12px;text-decoration:none;display:inline-block}
+    button:hover,.action:hover{border-color:var(--green)}button:disabled{opacity:.5;cursor:not-allowed}
+    .top{border-bottom:1px solid var(--line);background:#101824;padding:14px max(20px,calc((100vw - 1200px)/2));display:flex;align-items:center;justify-content:space-between;gap:16px}
+    .brand{font-weight:800;letter-spacing:.08em;color:var(--green)}.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 70px}
+    .lead{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.lead h1{font-size:28px;margin:0 0 4px;overflow-wrap:anywhere}
+    .muted{color:var(--muted)}.small{font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:20px}
+    .stat,.card,.row,.check{border:1px solid var(--line);border-radius:12px;background:var(--surface)}.stat{padding:15px}.stat strong{font-size:24px;display:block;color:var(--green)}
+    .card{padding:18px;margin-bottom:16px}.card h2{font-size:18px;margin:0 0 12px}.card h3{font-size:14px;margin:0 0 6px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.row{padding:12px;margin:8px 0;overflow-wrap:anywhere}
+    .row-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.tag{border-radius:999px;padding:2px 8px;font-size:11px;background:#283a43;color:var(--green);white-space:nowrap}
+    .tag.warn{background:#3b321d;color:var(--amber)}.tag.bad{background:#402735;color:var(--red)}
+    .check{padding:13px;margin:8px 0}.check-grid{display:grid;grid-template-columns:180px 1fr 1fr auto;gap:8px;align-items:start}
+    select,textarea{width:100%;border:1px solid var(--line);border-radius:7px;background:#0c1520;color:var(--text);padding:8px}
+    textarea{min-height:58px;resize:vertical}details summary{cursor:pointer;color:var(--green)}.pre{white-space:pre-wrap;overflow-wrap:anywhere}
+    .notice{border-left:3px solid var(--amber);padding:9px 12px;background:#28251d;color:var(--muted);margin:12px 0}
+    #feedback{position:fixed;bottom:18px;right:18px;padding:10px 14px;border-radius:8px;background:#254636;color:#fff;display:none;max-width:360px}
+    @media(max-width:850px){.check-grid{grid-template-columns:1fr}.lead{display:block}.top{padding:12px 20px}}
+  </style>
+</head>
+<body>
+  <header class="top"><div class="brand">⬡ ReconX · Host</div><div><a class="action" href="/">Voltar ao ReconX</a> <button id="refresh">Atualizar dados</button></div></header>
+  <main class="wrap">
+    <div id="loading" class="muted">Carregando perfil...</div>
+    <div id="profile" hidden>
+      <div class="lead"><div><h1 id="host-name"></h1><div id="phase" class="muted"></div></div><div id="updated" class="muted small"></div></div>
+      <div id="stats" class="grid"></div>
+      <div class="notice">Os próximos passos são sugestões baseadas nos dados observados. Nenhuma ação é executada automaticamente; revise o escopo antes de iniciar outro pipeline. Ferramenta concluída não significa teste validado.</div>
+      <section class="card"><h2>Recomendações para este host</h2><div id="recommendations" class="cards"></div></section>
+      <section class="card"><h2>Pipelines disponíveis</h2><div id="pipelines" class="cards"></div></section>
+      <section class="card"><h2>Achados com alvo explícito</h2><div id="findings"></div></section>
+      <section class="card"><h2>Serviços e ativos observados</h2><div class="cards"><div><h3>Serviços</h3><div id="services"></div></div><div><h3>Ativos</h3><div id="assets"></div></div></div></section>
+      <section class="card"><h2>Histórico de scans</h2><div id="scans"></div></section>
+      <section class="card"><h2>Execuções recentes</h2><div id="runs"></div></section>
+      <section class="card" id="checklist"><h2>Checklist manual por host</h2><p class="muted small">“Testado” exige referência de evidência. Não cole credenciais: as notas ficam no SQLite local.</p><div id="checks"></div></section>
+    </div>
+  </main>
+  <div id="feedback" role="status"></div>
+  <script>
+    const hostId = {{ host_id|int }};
+    const labels = {host_recon:'Recon inicial por host',web_recon:'Recon web segmentado',api_recon:'Recon API segmentado'};
+    const phaseLabels = {recon_inicial:'Recon inicial',recon_segmentado:'Recon segmentado',revisao_manual:'Recon + revisão manual'};
+    const statusLabels = {pending:'Pendente',in_progress:'Em andamento',tested:'Testado',inconclusive:'Inconclusivo',not_applicable:'Não aplicável'};
+    const webPorts = [80,443,8000,8008,8080,8081,8443,8888,3000,5000];
+    const el = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    function notify(message, error=false) {
+      const box = el('feedback'); box.textContent = message; box.style.background = error ? '#743445' : '#254636'; box.style.display = 'block';
+      clearTimeout(notify.timer); notify.timer = setTimeout(() => box.style.display = 'none', 4500);
+    }
+    function pipelineTarget(profile, key) {
+      if (key === 'host_recon') return profile.host;
+      const service = profile.services.find(item => /http|ssl/i.test(item.service) || webPorts.includes(item.port));
+      const scheme = service && (service.port === 443 || service.port === 8443 || /https|ssl/i.test(service.service)) ? 'https' : 'http';
+      const host = profile.host.includes(':') ? `[${profile.host}]` : profile.host;
+      const base = service ? `${scheme}://${host}:${service.port}` : `http://${host}`;
+      if (key === 'api_recon') {
+        const api = profile.assets.find(item => /\/(?:api|graphql|swagger|openapi)(?:\/|\b)/i.test(item.value));
+        if (api) return /^https?:\/\//i.test(api.value) ? api.value : base + api.value;
+      }
+      return base;
+    }
+    function pipelineLink(profile, key) {
+      const params = new URLSearchParams({target:pipelineTarget(profile,key),pipeline:key});
+      return `/?${params.toString()}`;
+    }
+    function render(profile) {
+      el('loading').hidden = true; el('profile').hidden = false;
+      el('host-name').textContent = profile.host;
+      document.title = `${profile.host} · ReconX`;
+      el('phase').textContent = `Etapa sugerida: ${phaseLabels[profile.phase] || profile.phase}`;
+      el('updated').textContent = `Atualizado: ${profile.updated_at || '—'}`;
+      const values = [['Scans',profile.scans.length],['Execuções recentes',profile.runs.length],['Serviços',profile.services.length],['Achados atribuídos',profile.findings.length]];
+      el('stats').innerHTML = values.map(([label,value]) => `<div class="stat"><strong>${value}</strong>${label}</div>`).join('');
+      el('recommendations').innerHTML = profile.recommendations.length ? profile.recommendations.map(rec => `
+        <div class="row"><h3>${esc(rec.title)}</h3><p class="small muted">${esc(rec.reason)}</p>
+          ${rec.pipeline ? `<a class="action" href="${esc(pipelineLink(profile,rec.pipeline))}" target="_blank" rel="noopener">Preparar pipeline ↗</a>` : '<a class="action" href="#checklist">Revisar manualmente</a>'}
+        </div>`).join('') : '<p class="muted">Nenhuma recomendação nova; revise o checklist e os resultados.</p>';
+      el('pipelines').innerHTML = profile.suggestions.map(s => `
+        <div class="row"><div class="row-head"><h3>${esc(labels[s.key] || s.key)}</h3><span class="tag ${s.ready ? '' : 'warn'}">${s.ready ? 'Disponível' : 'Aguardando evidência'}</span></div>
+        <p class="small muted">${esc(s.reason)}</p>
+        ${s.ready ? `<a class="action" href="${esc(pipelineLink(profile,s.key))}" target="_blank" rel="noopener">Preparar no ReconX ↗</a>` : ''}</div>`).join('');
+      el('findings').innerHTML = profile.findings.length ? profile.findings.map(f => `
+        <div class="row"><div class="row-head"><h3>${esc(f.name)}</h3><span class="tag ${['critical','high'].includes(f.severity) ? 'bad' : 'warn'}">${esc(f.severity)}</span></div>
+          <div class="small muted">${esc(f.tool)} · ${esc(f.confidence)} · ${esc(f.target)} · scan ${esc(f.scan_id)}</div>
+          ${f.evidence ? `<details><summary>Ver evidência</summary><div class="pre small">${esc(f.evidence)}</div></details>` : ''}</div>`).join('') : '<p class="muted">Nenhum achado com alvo explícito atribuído a este host. Consulte também os outputs brutos.</p>';
+      el('services').innerHTML = profile.services.length ? profile.services.map(s => `<div class="row">${Number(s.port)}/${esc(s.protocol)} · ${esc(s.service)} <span class="small muted">· scan ${esc(s.scan_id)}</span></div>`).join('') : '<p class="muted">Nenhum serviço observado.</p>';
+      el('assets').innerHTML = profile.assets.length ? profile.assets.map(a => `<div class="row"><span class="tag">${esc(a.atype)}</span> ${esc(a.value)}</div>`).join('') : '<p class="muted">Nenhum ativo observado.</p>';
+      el('scans').innerHTML = profile.scans.length ? profile.scans.map(s => `<div class="row"><div class="row-head"><strong>${esc(s.pipeline || 'Custom')}</strong><span class="tag">${esc(s.status || 'desconhecido')}</span></div><div class="small muted">${esc(s.started_at || '')} · ${esc(s.target || '')}</div><a href="/api/results/${encodeURIComponent(s.scan_id)}" target="_blank" rel="noopener">Abrir resultado ${esc(s.scan_id)} ↗</a></div>`).join('') : '<p class="muted">Nenhuma scan executada.</p>';
+      el('runs').innerHTML = profile.runs.length ? profile.runs.map(r => `<div class="row"><div class="row-head"><strong>${esc(r.tool)}</strong><span class="tag ${r.status === 'failed' ? 'bad' : r.status === 'skipped' ? 'warn' : ''}">${esc(r.status)}</span></div><div class="small muted">${esc(r.created_at)} · ${esc(r.target)} · scan ${esc(r.scan_id)}</div>${r.output_path ? `<a href="/api/hosts/${hostId}/runs/${Number(r.id)}/output" target="_blank" rel="noopener">Ver output bruto ↗</a>` : ''}</div>`).join('') : '<p class="muted">Nenhuma execução registrada.</p>';
+      el('checks').innerHTML = profile.checks.map(c => `<div class="check" data-key="${esc(c.check_key)}"><h3>${esc(c.label)}</h3><div class="check-grid"><select class="check-status">${Object.entries(statusLabels).map(([value,label]) => `<option value="${value}" ${value === c.status ? 'selected' : ''}>${label}</option>`).join('')}</select><textarea class="check-note" maxlength="2000" placeholder="Observação">${esc(c.note)}</textarea><textarea class="check-evidence" maxlength="2000" placeholder="Referência da evidência">${esc(c.evidence)}</textarea><button class="check-save">Salvar</button></div></div>`).join('');
+      el('checks').querySelectorAll('.check-save').forEach(button => button.addEventListener('click', () => saveCheck(button.closest('.check'))));
+    }
+    async function loadProfile() {
+      try {
+        const response = await fetch(`/api/hosts/${hostId}`, {cache:'no-store'});
+        if (!response.ok) throw new Error('Perfil não encontrado');
+        render(await response.json());
+      } catch (error) { el('loading').textContent = error.message; notify(error.message,true); }
+    }
+    async function saveCheck(row) {
+      const key = row.dataset.key;
+      const payload = {status:row.querySelector('.check-status').value,note:row.querySelector('.check-note').value,evidence:row.querySelector('.check-evidence').value};
+      try {
+        const response = await fetch(`/api/hosts/${hostId}/checks/${encodeURIComponent(key)}`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Não foi possível salvar');
+        notify('Checklist salvo neste host');
+      } catch (error) { notify(error.message,true); }
+    }
+    el('refresh').addEventListener('click', loadProfile);
+    loadProfile();
+  </script>
+</body>
+</html>
