@@ -1,0 +1,1460 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReconX v4</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#080a0f;--bg2:#0e1118;--bg3:#141820;--bg4:#1a2030;
+  --b1:#1e2535;--b2:#252f45;
+  --g:#00ff88;--g2:#00cc6a;--c:#00d4ff;--p:#bd93f9;
+  --r:#ff5555;--o:#ffb86c;--y:#f1fa8c;--pk:#ff79c6;
+  --tx:#cdd6f4;--mu:#4e5a7a;--mu2:#6272a4;
+  --mono:'JetBrains Mono',monospace;--sans:'Syne',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px}
+
+.app{display:grid;grid-template-rows:44px 1fr;height:100vh}
+.body{display:grid;grid-template-columns:290px 1fr;overflow:hidden}
+
+/* TOPBAR */
+.topbar{background:var(--bg2);border-bottom:1px solid var(--b1);
+  display:flex;align-items:center;padding:0 16px;gap:10px}
+.logo{font-family:var(--sans);font-size:15px;color:var(--g);margin-right:6px}
+.logo b{color:var(--c)}
+.logo sup{font-size:8px;color:var(--mu2);font-family:var(--mono)}
+.nb{padding:4px 12px;border-radius:20px;cursor:pointer;font-size:11px;
+  color:var(--mu2);border:1px solid transparent;transition:.15s}
+.nb:hover{color:var(--tx)}
+.nb.on{background:rgba(0,212,255,.08);color:var(--c);border-color:rgba(0,212,255,.2)}
+
+/* PROXY STATUS PILL */
+.proxy-pill{
+  display:flex;align-items:center;gap:6px;margin-left:auto;
+  padding:4px 12px;border-radius:20px;border:1px solid var(--b2);
+  cursor:pointer;transition:.15s;font-size:10px;color:var(--mu2);
+}
+.proxy-pill:hover{border-color:var(--b2);background:var(--bg3)}
+.proxy-pill.active{border-color:rgba(0,255,136,.3);color:var(--g);background:rgba(0,255,136,.05)}
+.proxy-pill.warn{border-color:rgba(255,184,108,.3);color:var(--o);background:rgba(255,184,108,.05)}
+.px-dot{width:6px;height:6px;border-radius:50%;background:var(--mu);transition:.3s}
+.px-dot.on{background:var(--g);box-shadow:0 0 5px var(--g)}
+.px-dot.warn{background:var(--o)}
+.conn-dot{width:6px;height:6px;border-radius:50%;background:var(--mu)}
+.conn-dot.on{background:var(--g);box-shadow:0 0 4px var(--g);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* SIDEBAR */
+.sidebar{background:var(--bg2);border-right:1px solid var(--b1);
+  display:flex;flex-direction:column;overflow:hidden}
+.sb-sec{border-bottom:1px solid var(--b1);flex-shrink:0}
+.sb-hd{padding:9px 14px;font-size:9px;text-transform:uppercase;letter-spacing:2px;
+  color:var(--mu2);display:flex;align-items:center;justify-content:space-between}
+.sb-scroll{overflow-y:auto;flex:1}
+.sb-scroll::-webkit-scrollbar{width:3px}
+.sb-scroll::-webkit-scrollbar-thumb{background:var(--b2)}
+
+/* Proxy selector */
+.proxy-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:8px}
+.proxy-card{
+  border:1px solid var(--b1);border-radius:5px;padding:8px;cursor:pointer;
+  transition:.12s;text-align:center;
+}
+.proxy-card:hover{background:var(--bg3)}
+.proxy-card.sel{border-color:var(--g);background:rgba(0,255,136,.04)}
+.pc-icon{font-size:16px;margin-bottom:3px}
+.pc-name{font-size:10px;color:var(--tx);font-weight:500}
+.pc-desc{font-size:9px;color:var(--mu2);margin-top:2px;line-height:1.3}
+.proxy-custom{padding:0 8px 8px;display:none}
+.proxy-custom.show{display:block}
+.proxy-input{
+  width:100%;background:var(--bg3);border:1px solid var(--b2);border-radius:4px;
+  padding:6px 8px;color:var(--c);font-family:var(--mono);font-size:10px;
+  outline:none;margin-bottom:4px;
+}
+.proxy-input::placeholder{color:var(--mu);font-size:10px}
+.proxy-tip{font-size:9px;color:var(--mu);line-height:1.4;padding:6px 8px;
+  background:var(--bg4);border-radius:4px;border-left:2px solid var(--o);margin:4px 0}
+
+/* Target input */
+.tgt-wrap{padding:8px 14px}
+.tgt-in{width:100%;background:var(--bg3);border:1px solid var(--b2);
+  border-radius:5px;padding:8px 10px;color:var(--g);font-family:var(--mono);
+  font-size:12px;outline:none;transition:.15s}
+.tgt-in:focus{border-color:var(--g);box-shadow:0 0 0 2px rgba(0,255,136,.06)}
+.tgt-in::placeholder{color:var(--mu);font-size:10px}
+
+/* Pipeline cards */
+.pipe-list{padding:6px}
+.pipe-card{border:1px solid var(--b1);border-radius:6px;padding:9px;
+  cursor:pointer;margin-bottom:5px;transition:.12s;position:relative;overflow:hidden}
+.pipe-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:var(--accent,var(--c));opacity:0;transition:.15s}
+.pipe-card:hover{background:var(--bg3)}
+.pipe-card.sel{background:var(--bg4);border-color:var(--b2)}
+.pipe-card.sel::before,.pipe-card:hover::before{opacity:1}
+.ph{display:flex;align-items:center;gap:7px;margin-bottom:3px}
+.pn{font-family:var(--sans);font-size:11px;font-weight:700;color:var(--tx)}
+.pd{font-size:9px;color:var(--mu2);line-height:1.4}
+.pcount{font-size:9px;color:var(--mu);margin-top:3px}
+
+/* Steps */
+.step-list{padding:5px}
+.step-item{display:flex;align-items:flex-start;gap:7px;padding:6px 7px;
+  border-radius:4px;margin-bottom:2px;border:1px solid transparent;transition:.1s}
+.step-item:hover{background:var(--bg3)}
+.step-item.running{background:rgba(0,212,255,.04);border-color:rgba(0,212,255,.12)}
+.step-item.done{opacity:.55}
+.step-item.done .sn{background:rgba(0,255,136,.12);color:var(--g);border-color:rgba(0,255,136,.25)}
+.step-item.skipped{opacity:.35}
+.sn{width:18px;height:18px;border-radius:3px;flex-shrink:0;
+  background:var(--bg4);border:1px solid var(--b2);
+  display:flex;align-items:center;justify-content:center;font-size:8px;color:var(--mu2)}
+.si-running .sn{background:rgba(0,212,255,.1);color:var(--c);border-color:rgba(0,212,255,.25);
+  animation:rpulse .8s infinite}
+@keyframes rpulse{0%,100%{opacity:1}50%{opacity:.4}}
+.sb{flex:1;min-width:0}
+.sl{font-size:11px;color:var(--tx);font-weight:500}
+.sd{font-size:9px;color:var(--mu2);line-height:1.4}
+.sph{font-size:8px;padding:1px 5px;border-radius:3px;display:inline-block;margin-top:2px}
+.ph-recon{background:rgba(0,212,255,.08);color:var(--c);border:1px solid rgba(0,212,255,.15)}
+.ph-test{background:rgba(255,85,85,.08);color:var(--r);border:1px solid rgba(255,85,85,.15)}
+.sdel{color:var(--mu);cursor:pointer;padding:2px 4px;opacity:0;font-size:10px;flex-shrink:0}
+.step-item:hover .sdel{opacity:1}
+.sdel:hover{color:var(--r)}
+
+/* Add tool select */
+.add-wrap{padding:6px 14px}
+.add-row{display:flex;gap:5px}
+.add-sel{flex:1;background:var(--bg3);border:1px solid var(--b2);border-radius:4px;
+  padding:6px 7px;color:var(--tx);font-family:var(--mono);font-size:10px;outline:none}
+.add-sel option{background:var(--bg3)}
+
+/* Run bar */
+.run-bar{padding:9px 14px;border-top:1px solid var(--b1)}
+.btn{padding:7px 14px;border:none;border-radius:5px;cursor:pointer;
+  font-family:var(--mono);font-size:11px;font-weight:500;transition:.15s}
+.btn-g{background:var(--g);color:#080a0f}.btn-g:hover{background:var(--g2)}
+.btn-g:disabled{background:var(--mu);cursor:not-allowed;color:var(--bg)}
+.btn-r{background:rgba(255,85,85,.12);color:var(--r);border:1px solid rgba(255,85,85,.25)}
+.btn-r:hover{background:rgba(255,85,85,.22)}
+.btn-gh{background:transparent;color:var(--mu2);border:1px solid var(--b2)}
+.btn-gh:hover{color:var(--tx);background:var(--bg3)}
+.btn-o{background:rgba(255,184,108,.12);color:var(--o);border:1px solid rgba(255,184,108,.25)}
+.brow{display:flex;gap:5px}
+.bfull{width:100%}
+.run-st{font-size:10px;color:var(--mu2);text-align:center;margin-top:5px}
+
+/* PANELS */
+.panel{display:none;flex-direction:column;overflow:hidden}
+.panel.on{display:flex}
+.prog-bar{height:2px;background:var(--b1);flex-shrink:0}
+.prog-fill{height:100%;background:linear-gradient(90deg,var(--g),var(--c));transition:width .4s;width:0}
+
+/* Terminal */
+.term{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.tbar{background:var(--bg2);padding:7px 14px;border-bottom:1px solid var(--b1);
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.tdots{display:flex;gap:4px}
+.td{width:9px;height:9px;border-radius:50%}
+.td:nth-child(1){background:#ff5f57}.td:nth-child(2){background:#febc2e}.td:nth-child(3){background:#28c840}
+.tinfo{font-size:10px;color:var(--mu2)}
+.tbody{flex:1;overflow-y:auto;padding:12px 14px;font-size:11px;line-height:1.8}
+.tbody::-webkit-scrollbar{width:3px}
+.tbody::-webkit-scrollbar-thumb{background:var(--b2)}
+.tool-hdr{display:flex;align-items:center;gap:8px;padding:5px 0 2px;
+  margin-top:6px;border-top:1px solid var(--b1)}
+.th-num{font-size:9px;color:var(--mu);width:22px;text-align:right;flex-shrink:0}
+.th-lbl{font-size:12px;color:var(--c);font-weight:500}
+.th-proxy{font-size:9px;padding:1px 5px;border-radius:3px;
+  background:rgba(189,147,249,.1);color:var(--p);border:1px solid rgba(189,147,249,.2)}
+.th-cmd{font-size:9px;color:var(--mu2);word-break:break-all}
+.badge{display:inline-flex;align-items:center;gap:3px;font-size:9px;
+  padding:1px 6px;border-radius:3px;margin-top:2px}
+.b-ok{background:rgba(0,255,136,.07);color:var(--g);border:1px solid rgba(0,255,136,.15)}
+.b-warn{background:rgba(255,184,108,.07);color:var(--o);border:1px solid rgba(255,184,108,.15)}
+.b-skip{background:rgba(78,90,122,.15);color:var(--mu2);border:1px solid var(--b1)}
+/* output line colors */
+.lg{color:var(--g)}.lc{color:var(--c)}.lr{color:var(--r)}
+.ly{color:var(--y)}.lo{color:var(--o)}.lm{color:var(--mu2)}.lt{color:var(--tx)}
+
+/* COVERAGE PANEL */
+.cov-wrap{flex:1;overflow-y:auto;padding:14px}
+.cov-wrap::-webkit-scrollbar{width:3px}
+.cov-wrap::-webkit-scrollbar-thumb{background:var(--b2)}
+.cov-section{background:var(--bg2);border:1px solid var(--b1);border-radius:7px;
+  margin-bottom:10px;overflow:hidden}
+.cov-hdr{padding:11px 14px;display:flex;align-items:center;justify-content:space-between;
+  cursor:pointer;background:var(--bg3)}
+.cov-hdr:hover{background:var(--bg4)}
+.cov-title{display:flex;align-items:center;gap:8px}
+.cov-icon{font-size:14px}
+.cov-label{font-family:var(--sans);font-size:12px;font-weight:700;color:var(--tx)}
+.cov-progress{display:flex;align-items:center;gap:7px}
+.cov-bar{width:80px;height:4px;background:var(--b1);border-radius:2px;overflow:hidden}
+.cov-fill{height:100%;background:var(--g);border-radius:2px;transition:width .4s}
+.cov-pct{font-size:9px;color:var(--mu2)}
+.cov-body{padding:10px 14px;display:none}
+.cov-body.open{display:block}
+.check-item{display:flex;align-items:flex-start;gap:8px;padding:5px 0;
+  border-bottom:1px solid var(--b1);cursor:pointer}
+.check-item:last-child{border-bottom:none}
+.check-item:hover{background:rgba(0,0,0,.1)}
+.ci-box{width:14px;height:14px;border:1px solid var(--b2);border-radius:3px;
+  flex-shrink:0;margin-top:1px;display:flex;align-items:center;justify-content:center;
+  font-size:8px;transition:.1s}
+.check-item.checked .ci-box{background:var(--g);border-color:var(--g);color:#080a0f}
+.ci-text{font-size:11px;color:var(--tx);line-height:1.5}
+.check-item.checked .ci-text{color:var(--mu2);text-decoration:line-through}
+
+/* Auto findings from scan */
+.followup-list{padding:6px 14px 14px}
+.followup-item{
+  display:flex;align-items:flex-start;gap:7px;padding:7px 9px;
+  background:rgba(255,184,108,.04);border:1px solid rgba(255,184,108,.15);
+  border-radius:5px;margin-bottom:5px;font-size:11px;color:var(--o);line-height:1.5;
+}
+.fi-icon{flex-shrink:0;font-size:12px}
+
+/* CHECKPOINT OVERLAY */
+.cp-overlay{position:absolute;top:0;left:0;right:0;bottom:0;
+  background:rgba(8,10,15,.88);display:flex;align-items:center;
+  justify-content:center;z-index:200;backdrop-filter:blur(4px)}
+.cp-modal{background:var(--bg2);border:1px solid var(--o);border-radius:10px;
+  width:660px;max-height:78vh;display:flex;flex-direction:column;
+  box-shadow:0 0 40px rgba(255,184,108,.12)}
+.cp-hdr{padding:16px 18px;border-bottom:1px solid var(--b1);
+  display:flex;align-items:center;justify-content:space-between}
+.cp-title{font-family:var(--sans);font-size:14px;font-weight:700;
+  display:flex;align-items:center;gap:7px;color:var(--tx)}
+.cp-title span{color:var(--o)}
+.cp-sub{font-size:10px;color:var(--mu2);margin-top:3px}
+.cp-body{flex:1;overflow-y:auto;padding:12px 18px}
+.cp-body::-webkit-scrollbar{width:3px}
+.cp-body::-webkit-scrollbar-thumb{background:var(--b2)}
+.cp-tgt{display:flex;align-items:center;gap:8px;padding:6px 8px;
+  background:var(--bg3);border:1px solid var(--b1);border-radius:4px;
+  cursor:pointer;margin-bottom:3px;transition:.1s}
+.cp-tgt:hover{border-color:var(--b2)}
+.cp-tgt.sel{background:rgba(0,255,136,.04);border-color:rgba(0,255,136,.2)}
+.cp-check{width:13px;height:13px;border:1px solid var(--b2);border-radius:2px;
+  flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:7px}
+.cp-tgt.sel .cp-check{background:var(--g);border-color:var(--g);color:#080a0f}
+.cp-type{font-size:8px;padding:1px 5px;border-radius:3px;flex-shrink:0}
+.t-host{background:rgba(189,147,249,.1);color:var(--p);border:1px solid rgba(189,147,249,.2)}
+.t-url{background:rgba(0,212,255,.1);color:var(--c);border:1px solid rgba(0,212,255,.2)}
+.t-path{background:rgba(0,255,136,.08);color:var(--g);border:1px solid rgba(0,255,136,.15)}
+.t-finding{background:rgba(255,85,85,.08);color:var(--r);border:1px solid rgba(255,85,85,.15)}
+.cp-val{font-size:10px;color:var(--tx);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cp-followups{margin-top:12px;padding-top:10px;border-top:1px solid var(--b1)}
+.cp-fup-title{font-size:9px;text-transform:uppercase;letter-spacing:1px;
+  color:var(--mu2);margin-bottom:7px}
+.cp-fup-item{font-size:10px;color:var(--o);padding:4px 0;
+  border-bottom:1px solid var(--b1);display:flex;gap:6px}
+.cp-fup-item:last-child{border-bottom:none}
+.cp-ft{padding:12px 18px;border-top:1px solid var(--b1);
+  display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cp-all{font-size:10px;color:var(--c);cursor:pointer}
+.cp-all:hover{text-decoration:underline}
+.cp-cnt{font-size:10px;color:var(--mu2)}
+
+/* RESULTS */
+.results-wrap{flex:1;overflow-y:auto;padding:14px}
+.rc{background:var(--bg2);border:1px solid var(--b1);border-radius:6px;
+  padding:11px;margin-bottom:7px;cursor:pointer;transition:.12s}
+.rc:hover{border-color:var(--b2);background:var(--bg3)}
+.rc-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.rc-t{color:var(--g);font-size:12px;font-weight:500}
+.rc-id{font-size:9px;color:var(--c)}
+.rc-meta{display:flex;gap:10px;font-size:10px;color:var(--mu2)}
+.rc-body{margin-top:9px;display:none;background:var(--bg);border:1px solid var(--b1);
+  border-radius:4px;padding:9px;font-size:10px;line-height:1.7;
+  white-space:pre-wrap;color:var(--tx);max-height:280px;overflow-y:auto}
+.px-badge{font-size:8px;padding:1px 6px;border-radius:3px;
+  background:rgba(189,147,249,.1);color:var(--p);border:1px solid rgba(189,147,249,.2)}
+
+/* Toast */
+.toast{position:fixed;bottom:16px;right:16px;background:var(--bg3);
+  border:1px solid var(--b2);border-radius:6px;padding:9px 14px;
+  font-size:11px;opacity:0;transform:translateY(8px);transition:.2s;z-index:999}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.ok{border-left:3px solid var(--g)}
+.toast.warn{border-left:3px solid var(--o)}
+.toast.err{border-left:3px solid var(--r)}
+
+/* Right panel position relative for overlay */
+.right-wrap{display:flex;flex-direction:column;overflow:hidden;position:relative}
+::-webkit-scrollbar{width:3px;height:3px}
+::-webkit-scrollbar-thumb{background:var(--b2);border-radius:2px}
+
+/* ACTION ITEMS */
+.ai-section{margin-bottom:14px}
+.ai-section-hdr{font-size:9px;text-transform:uppercase;letter-spacing:2px;
+  padding:6px 0 8px;display:flex;align-items:center;gap:7px;border-bottom:1px solid var(--b1);margin-bottom:7px}
+.ai-sect-label{font-family:var(--sans);font-size:11px;font-weight:700}
+.ai-sect-immediate{color:var(--r)}.ai-sect-worth{color:var(--o)}.ai-sect-optional{color:var(--mu2)}
+.ai-count{font-size:9px;padding:1px 6px;border-radius:9px;background:var(--bg4)}
+.ai-item{display:flex;align-items:flex-start;gap:9px;padding:8px 10px;
+  background:var(--bg2);border:1px solid var(--b1);border-left-width:3px;
+  border-radius:5px;margin-bottom:5px;transition:.1s;cursor:default}
+.ai-item:hover{background:var(--bg3)}
+.ai-item.ai-imm{border-left-color:#ff4d6d}
+.ai-item.ai-worth{border-left-color:#ffb86c}
+.ai-item.ai-opt{border-left-color:var(--b2)}
+.ai-main{flex:1;min-width:0}
+.ai-name{font-size:11px;color:var(--tx);word-break:break-word}
+.ai-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.ai-meta{font-size:9px;color:var(--mu2);margin-top:2px}
+/* confidence badges */
+.cb{font-size:8px;padding:1px 6px;border-radius:3px;font-weight:700;letter-spacing:.3px}
+.cb-confirmed{background:rgba(255,77,109,.12);color:#ff4d6d;border:1px solid rgba(255,77,109,.25)}
+.cb-likely{background:rgba(255,184,108,.1);color:var(--o);border:1px solid rgba(255,184,108,.2)}
+.cb-possible{background:rgba(78,90,122,.2);color:var(--mu2);border:1px solid var(--b1)}
+/* verify button + result */
+.vbtn{font-family:var(--sans);font-size:9px;font-weight:700;white-space:nowrap;cursor:pointer;
+  align-self:center;padding:4px 9px;border-radius:5px;
+  background:rgba(0,212,255,.08);color:var(--c);border:1px solid rgba(0,212,255,.3);transition:.1s}
+.vbtn:hover{background:rgba(0,212,255,.16)}
+.vbtn:disabled{opacity:.5;cursor:wait}
+.vbtn.ok{background:rgba(0,255,136,.1);color:var(--g);border-color:rgba(0,255,136,.35)}
+.vbtn.fail{background:rgba(255,77,109,.1);color:#ff4d6d;border-color:rgba(255,77,109,.3)}
+.vall-prog{font-size:9px;color:var(--mu2);margin-left:8px;align-self:center;font-family:var(--mono)}
+.vres{margin:0 0 5px 0;padding:8px 10px;border-radius:5px;background:#05070c;
+  border:1px solid var(--b1);border-left:3px solid var(--c)}
+.vres.ok{border-left-color:var(--g)}.vres.fail{border-left-color:#ff4d6d}
+.vres-hdr{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}
+.vres pre{font-family:var(--mono);font-size:10px;color:var(--mu2);white-space:pre-wrap;
+  word-break:break-word;max-height:240px;overflow:auto;margin:0}
+/* vector badge */
+.vb{font-size:8px;padding:1px 6px;border-radius:3px;
+  background:rgba(0,212,255,.07);color:var(--c);border:1px solid rgba(0,212,255,.15)}
+/* checklist relevante */
+.ai-checklist{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px;padding-top:10px;border-top:1px solid var(--b1)}
+.ai-cl-chip{font-size:9px;padding:3px 9px;border-radius:20px;cursor:pointer;
+  background:rgba(189,147,249,.07);color:var(--p);border:1px solid rgba(189,147,249,.2)}
+.ai-cl-chip:hover{background:rgba(189,147,249,.15)}
+/* empty state */
+.empty{text-align:center;padding:40px 20px;color:var(--mu2)}
+.ei{font-size:26px;opacity:.2;margin-bottom:10px}
+.et{font-family:var(--sans);font-size:13px;color:var(--tx);margin-bottom:5px}
+.fnd-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.sev-chip{padding:3px 9px;border-radius:20px;font-size:10px;font-weight:600;
+  border:1px solid var(--b2);display:flex;gap:6px;align-items:center}
+.sev-chip b{font-variant-numeric:tabular-nums}
+.fnd-row{display:flex;gap:10px;align-items:flex-start;background:var(--bg2);
+  border:1px solid var(--b1);border-left-width:3px;border-radius:5px;
+  padding:8px 11px;margin:5px 0}
+.fnd-row:hover{background:var(--bg3)}
+.fnd-tag{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+  padding:2px 6px;border-radius:3px;white-space:nowrap;color:var(--bg)}
+.fnd-name{flex:1;font-size:11px;color:var(--tx);word-break:break-word}
+.fnd-meta{font-size:9px;color:var(--mu2);margin-top:2px}
+.sev-critical{--sc:#ff4d6d} .sev-high{--sc:#ff8c42} .sev-medium{--sc:#ffd93d}
+.sev-low{--sc:#4dabf7} .sev-info{--sc:#7a8896} .sev-unknown{--sc:#55606e}
+.fnd-row.sev-critical{border-left-color:#ff4d6d}
+.fnd-row.sev-high{border-left-color:#ff8c42}
+.fnd-row.sev-medium{border-left-color:#ffd93d}
+.fnd-row.sev-low{border-left-color:#4dabf7}
+.fnd-row.sev-info{border-left-color:#7a8896}
+.fnd-row.sev-unknown{border-left-color:#55606e}
+.nb-badge{display:inline-block;min-width:15px;padding:0 4px;margin-left:5px;
+  border-radius:9px;background:#ff4d6d;color:#fff;font-size:9px;font-weight:700;
+  text-align:center;vertical-align:middle}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="logo">⬡ Recon<b>X</b> <sup>v5</sup></div>
+  <div class="nb on" id="nb-session" onclick="showPanel('session')">Sessão</div>
+  <div class="nb" id="nb-coverage" onclick="showPanel('coverage')">Cobertura</div>
+  <div class="nb" id="nb-findings" onclick="showPanel('findings')">Findings<span class="nb-badge" id="nb-find-badge" style="display:none">0</span></div>
+  <div class="nb" id="nb-results"  onclick="showPanel('results')">Resultados</div>
+  <div class="nb" id="nb-actions" onclick="showPanel('actions')">Ação<span class="nb-badge" id="nb-act-badge" style="display:none;background:var(--o)">!</span></div>
+
+  <!-- Proxy pill -->
+  <div class="proxy-pill" id="proxy-pill" onclick="toggleProxySidebar()">
+    <div class="px-dot" id="px-dot"></div>
+    <span id="px-label">Sem proxy</span>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:5px;margin-left:8px">
+    <div class="conn-dot" id="conn-dot"></div>
+    <span id="conn-txt" style="font-size:10px;color:var(--mu2)">offline</span>
+  </div>
+</div>
+
+<!-- BODY -->
+<div class="body">
+
+<!-- SIDEBAR -->
+<aside class="sidebar">
+
+  <!-- Proxy selector -->
+  <div class="sb-sec" id="proxy-sidebar" style="display:none">
+    <div class="sb-hd">Configurar Proxy</div>
+    <div class="proxy-grid" id="proxy-grid"></div>
+    <div class="proxy-custom" id="proxy-custom">
+      <input class="proxy-input" id="custom-http" placeholder="HTTP: http://host:porta">
+      <input class="proxy-input" id="custom-socks" placeholder="SOCKS5: socks5://host:porta">
+      <button class="btn btn-o bfull" style="font-size:10px;padding:6px" onclick="applyCustomProxy()">Aplicar</button>
+    </div>
+    <div id="proxy-tip" class="proxy-tip" style="margin:0 8px 8px;display:none"></div>
+  </div>
+
+  <!-- Target + Scope -->
+  <div class="sb-sec">
+    <div class="sb-hd">Alvo</div>
+    <div class="tgt-wrap">
+      <input class="tgt-in" id="tgt"
+        placeholder="domain.com | 10.10.10.1 | http://..." oninput="updateRunBtn()">
+      <input class="tgt-in" id="scope" style="margin-top:5px;font-size:10px"
+        placeholder="Escopo (opcional): 10.0.0.0/8, example.com">
+    </div>
+  </div>
+
+  <!-- Pipelines -->
+  <div class="sb-sec">
+    <div class="sb-hd">Pipelines
+      <span style="cursor:pointer;color:var(--mu);font-size:9px" onclick="clearAll()">limpar</span>
+    </div>
+    <div class="pipe-list" id="pipe-list"></div>
+  </div>
+
+  <!-- Steps -->
+  <div class="sb-sec" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+    <div class="sb-hd">Passos
+      <span id="step-count" style="color:var(--mu);font-size:9px">0</span>
+    </div>
+    <div class="sb-scroll">
+      <div class="step-list" id="step-list"></div>
+      <div class="add-wrap">
+        <div class="add-row">
+          <select class="add-sel" id="add-sel"></select>
+          <button class="btn btn-gh" style="padding:6px 10px" onclick="addTool()">+</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Run -->
+  <div class="run-bar">
+    <div class="brow">
+      <button class="btn btn-g bfull" id="run-btn" onclick="startScan()" disabled>▶ Iniciar</button>
+      <button class="btn btn-r" id="stop-btn" style="display:none;padding:7px 10px" onclick="stopScan()">■</button>
+    </div>
+    <div class="run-st" id="run-st"></div>
+  </div>
+</aside>
+
+<!-- RIGHT -->
+<div class="right-wrap">
+  <div class="prog-bar"><div class="prog-fill" id="prog"></div></div>
+
+  <!-- SESSION PANEL -->
+  <div class="panel on" id="panel-session">
+    <div class="term">
+      <div class="tbar">
+        <div class="tdots"><div class="td"></div><div class="td"></div><div class="td"></div></div>
+        <div class="tinfo" id="tinfo">reconx v5 — aguardando</div>
+        <button class="btn btn-gh" style="padding:3px 8px;font-size:9px" onclick="clearTerm()">limpar</button>
+      </div>
+      <div class="tbody" id="tbody">
+        <div class="lm">  ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗██╗  ██╗  ██╗   ██╗██╗  ██╗</div>
+        <div class="lm">  ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║╚██╗██╔╝  ██║   ██║╚██╗██╔╝</div>
+        <div class="lm">  ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║ ╚███╔╝   ██║   ██║ ╚███╔╝ </div>
+        <div class="lm">  ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║ ██╔██╗   ╚██╗ ██╔╝ ██╔██╗ </div>
+        <div class="lm">  ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║██╔╝ ██╗   ╚████╔╝ ██╔╝ ██╗</div>
+        <div class="lm">  ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝    ╚═══╝  ╚═╝  ╚═╝</div>
+        <br>
+        <div class="lm">  Proxy Layer + Maximum Coverage — use apenas em ambientes autorizados</div>
+        <br>
+        <div class="lm">  [*] Configure o proxy à esquerda, defina o alvo e inicie.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COVERAGE PANEL -->
+  <div class="panel" id="panel-coverage">
+    <div class="cov-wrap" id="cov-wrap">
+      <div style="font-size:11px;color:var(--mu2);margin-bottom:12px;line-height:1.6">
+        Checklist de testes manuais — marque conforme for testando no Burp/ZAP.
+        O automático cobre <span style="color:var(--o)">~30%</span> da superfície real.
+        O restante depende de você.
+      </div>
+      <!-- Followups da scan -->
+      <div id="followup-section" style="display:none">
+        <div style="font-size:9px;text-transform:uppercase;letter-spacing:2px;
+          color:var(--o);margin-bottom:8px">⚠ Pontos específicos desta scan</div>
+        <div id="followup-list" class="followup-list" style="padding:0 0 14px"></div>
+      </div>
+      <!-- Checklist categories -->
+      <div id="checklist-body"></div>
+    </div>
+  </div>
+
+  <!-- FINDINGS PANEL -->
+  <div class="panel" id="panel-findings">
+    <div class="cov-wrap">
+      <div class="fnd-bar" id="fnd-bar"></div>
+      <div id="fnd-list">
+        <div class="empty"><div class="ei">⚑</div><div class="et">Sem findings ainda — inicie uma scan</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULTS PANEL -->
+  <div class="panel" id="panel-results">
+    <div class="results-wrap" id="results-wrap">
+      <div class="empty"><div class="ei">◈</div><div class="et">Sem resultados</div></div>
+    </div>
+  </div>
+
+  <!-- ACTION ITEMS PANEL -->
+  <div class="panel" id="panel-actions">
+    <div class="cov-wrap" id="actions-wrap">
+      <div class="empty"><div class="ei">⚡</div><div class="et">Conclua uma scan para ver os itens de ação</div></div>
+    </div>
+  </div>
+
+  <!-- CHECKPOINT OVERLAY -->
+  <div class="cp-overlay" id="cp-overlay" style="display:none">
+    <div class="cp-modal">
+      <div class="cp-hdr">
+        <div>
+          <div class="cp-title">⚠ <span>Checkpoint</span> — Revisar targets</div>
+          <div class="cp-sub" id="cp-sub">Selecione o que passa para a próxima fase</div>
+        </div>
+        <span style="font-size:10px;color:var(--mu2)" id="cp-next"></span>
+      </div>
+      <div class="cp-body">
+        <div id="cp-list"></div>
+        <div id="cp-followups-section" style="display:none">
+          <div class="cp-followups">
+            <div class="cp-fup-title">⚡ Testes manuais sugeridos (baseado no que foi encontrado)</div>
+            <div id="cp-fup-list"></div>
+          </div>
+        </div>
+      </div>
+      <div class="cp-ft">
+        <span class="cp-all" onclick="cpAll()">selecionar todos</span>
+        <span class="cp-cnt" id="cp-cnt">0 selecionados</span>
+        <div style="display:flex;gap:7px">
+          <button class="btn btn-r" onclick="cpSkip()">Pular fase</button>
+          <button class="btn btn-o" id="cp-approve-btn" onclick="cpApprove()">✓ Aprovar e continuar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /right-wrap -->
+</div><!-- /body -->
+</div><!-- /app -->
+
+<div class="toast" id="toast"></div>
+
+<!-- DATA INJECTION (safe JSON) -->
+<script type="application/json" id="_tools">{{ tools_json | safe }}</script>
+<script type="application/json" id="_pipes">{{ pipelines_json | safe }}</script>
+<script type="application/json" id="_proxies">{{ proxy_profiles_json | safe }}</script>
+<script type="application/json" id="_checklist">{{ manual_checklist_json | safe }}</script>
+
+<script>
+const TOOLS     = JSON.parse(document.getElementById('_tools').textContent);
+const PIPELINES = JSON.parse(document.getElementById('_pipes').textContent);
+const PROXIES   = JSON.parse(document.getElementById('_proxies').textContent);
+const CHECKLIST = JSON.parse(document.getElementById('_checklist').textContent);
+
+// ═══════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════
+const S = {
+  steps: [], selectedPreset: null, scanId: null,
+  running: false, total: 0, done: 0,
+  checkpointData: null, cpSelected: new Set(),
+  followups: [], checkProgress: {},
+  proxyShown: false, selectedProxy: 'none',
+  findings: [], findSummary: null, actionItems: null,
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// SOCKET
+// ═══════════════════════════════════════════════════════════════════
+const socket = io();
+socket.on('connect',    () => setConn(true));
+socket.on('disconnect', () => setConn(false));
+
+socket.on('connected', d => {
+  tlog('lg','[+] Conectado ao ReconX v4');
+  updateProxyPill(d.proxy);
+});
+
+socket.on('proxy_set', d => {
+  updateProxyPill(d);
+  toast(`Proxy: ${d.label || d.profile}`, d.reachable ? 'ok' : 'warn');
+});
+
+socket.on('proxy_warning', d => {
+  tlog('lo', `[!] ${d.message}`);
+  showProxyTip(d.profile);
+});
+
+socket.on('pipeline_started', d => {
+  S.scanId = d.scan_id; S.lastScanId = d.scan_id; S.running = true; S.total = 0; S.done = 0;
+  S.findings = []; S.findSummary = null; S.actionItems = null; renderFindings(); updateFindBadge();
+  document.getElementById('stop-btn').style.display = '';
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('tinfo').textContent = `scan ${d.scan_id} — ${d.target}`;
+  const px = d.proxy;
+  tlog('lm','═'.repeat(58));
+  tlog('lg', `[▶] SCAN ${d.scan_id} — ${d.pipeline}`);
+  tlog('lc', `[*] Alvo: ${d.target}`);
+  if (px.active) tlog('lp', `[*] Proxy: ${px.label} (${px.http || px.socks}) ${px.reachable ? '✓' : '⚠ não acessível'}`);
+  tlog('lm','═'.repeat(58));
+  setProgress(0);
+  setRunSt('Iniciando...');
+});
+
+socket.on('finding', d => {
+  S.findings.push(d);
+  renderFindings();
+  updateFindBadge();
+});
+socket.on('findings_summary', d => {
+  S.findSummary = d;
+  renderFindBar();
+});
+
+socket.on('stage_start', d => {
+  tlog('','');
+  tlog('lc', `  ┌─ ${d.stage_name.toUpperCase()}`);
+  tlog('lm', `  │  ${d.tools.join(' → ')}`);
+  tlog('lm', `  └${'─'.repeat(46)}`);
+});
+
+socket.on('tool_start', d => {
+  S.total++;
+  updateStep(S.done, 'running');
+  tlog('','');
+  const hdr = document.createElement('div');
+  hdr.className = 'tool-hdr';
+  hdr.innerHTML = `
+    <span class="th-num">${String(S.total).padStart(2,'0')}</span>
+    <span class="th-lbl">${d.label}</span>
+    ${d.proxy ? `<span class="th-proxy">${d.proxy}</span>` : ''}`;
+  document.getElementById('tbody').appendChild(hdr);
+  const cmd = document.createElement('div');
+  cmd.className = 'th-cmd lm';
+  cmd.textContent = '    $ ' + d.cmd;
+  document.getElementById('tbody').appendChild(cmd);
+  scrollTerm();
+  setRunSt(`[${S.done+1}] ${d.label}`);
+});
+
+socket.on('tool_output', d => {
+  const l = d.line;
+  let cls = 'lt';
+  if (/error|exception|fail|denied|refused/i.test(l)) cls = 'lr';
+  else if (/vuln|found|open|inject|xss|CVE-|\[\+\]/i.test(l)) cls = 'ly';
+  else if (/https?:\/\//.test(l)) cls = 'lc';
+  else if (/\[\*\]|\[!\]|warning/i.test(l)) cls = 'lo';
+  tlog(cls, '    ' + l);
+});
+
+socket.on('tool_done', d => {
+  S.done++;
+  updateStep(S.done - 1, d.exit_code === 0 ? 'done' : 'warn');
+  setProgress((S.done / Math.max(S.total, 1)) * 80);
+  const ok = d.exit_code === 0;
+  const b = document.createElement('div');
+  b.innerHTML = `    <span class="badge ${ok?'b-ok':'b-warn'}">${ok?'✓':'!'} ${d.elapsed}s · ${d.lines} linhas</span>`;
+  document.getElementById('tbody').appendChild(b);
+  scrollTerm();
+  // Accumulate followups
+  if (d.manual_followup) S.followups.push(...d.manual_followup);
+});
+
+socket.on('tool_skip', d => {
+  const b = document.createElement('div');
+  b.innerHTML = `    <span class="badge b-skip">⊘ ${d.tool} — ${d.reason}</span>`;
+  document.getElementById('tbody').appendChild(b);
+  scrollTerm();
+});
+
+socket.on('stage_done', d => {
+  tlog('lg', `  [✓] ${d.stage_name} — ${d.extracted_count} targets extraídos`);
+  if (d.manual_followups) S.followups.push(...d.manual_followups);
+});
+
+socket.on('checkpoint_auto', d => {
+  tlog('lg', `  [⚡] AUTO-CHECKPOINT — ${d.reason}`);
+  tlog('lg', `  [→] Continuando para: ${d.next_stage} com ${d.approved_count} targets`);
+});
+
+socket.on('checkpoint', d => {
+  tlog('','');
+  tlog('lo','━'.repeat(58));
+  tlog('lo', `  ⚠  CHECKPOINT — ${d.after_stage_name}`);
+  tlog('lo', `     ${d.total} targets → próxima fase: ${d.next_stage}`);
+  tlog('lo','━'.repeat(58));
+  showCheckpoint(d);
+  setRunSt('Aguardando revisão...');
+});
+
+socket.on('checkpoint_resumed', d => {
+  hideCheckpoint();
+  tlog('lg', `  [✓] Checkpoint aprovado — ${d.approved_count} targets → ${d.next_stage}`);
+  setRunSt('Continuando...');
+});
+
+socket.on('scope_warning', d => {
+  tlog('lo', `  [⚠] ESCOPO: ${d.message}`);
+  toast('Targets fora do escopo removidos','warn');
+});
+
+socket.on('pipeline_complete', d => {
+  S.running = false; S.scanId = null;
+  setProgress(100);
+  document.getElementById('stop-btn').style.display = 'none';
+  document.getElementById('run-btn').disabled = false;
+  document.getElementById('tinfo').textContent = 'reconx — concluído';
+  setRunSt('');
+  tlog('','');
+  tlog('lm','═'.repeat(58));
+  tlog('lg','[✓] SCAN CONCLUÍDA');
+  tlog('lm','═'.repeat(58));
+  toast('Scan concluída!','ok');
+  // Load action items (auto-muda para aba Ação se tiver imediatos)
+  const finishedId = d.scan_id || S.scanId;
+  if (finishedId) loadActionItems(finishedId);
+  // Update coverage tab with followups
+  if (d.manual_followups) S.followups.push(...d.manual_followups);
+  S.followups = [...new Set(S.followups)];
+  renderFollowups();
+  loadResults();
+  markAllDone();
+});
+
+socket.on('scan_cancelled', () => {
+  S.running = false; S.scanId = null;
+  document.getElementById('stop-btn').style.display = 'none';
+  document.getElementById('run-btn').disabled = false;
+  setRunSt(''); hideCheckpoint();
+  tlog('lo','[!] Scan cancelada');
+  toast('Cancelado','warn');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// PROXY
+// ═══════════════════════════════════════════════════════════════════
+function renderProxyGrid() {
+  const grid = document.getElementById('proxy-grid');
+  grid.innerHTML = Object.entries(PROXIES).map(([key, p]) => `
+    <div class="proxy-card ${S.selectedProxy===key?'sel':''}" onclick="selectProxy('${key}')">
+      <div class="pc-icon">${p.icon}</div>
+      <div class="pc-name">${p.label}</div>
+      <div class="pc-desc">${p.desc}</div>
+    </div>`).join('');
+}
+
+function selectProxy(key) {
+  S.selectedProxy = key;
+  renderProxyGrid();
+  const isCustom = key === 'custom';
+  document.getElementById('proxy-custom').className = 'proxy-custom' + (isCustom ? ' show' : '');
+
+  if (!isCustom) {
+    socket.emit('set_proxy', { profile: key });
+    showProxyTip(key);
+  }
+}
+
+function applyCustomProxy() {
+  const http  = document.getElementById('custom-http').value.trim();
+  const socks = document.getElementById('custom-socks').value.trim();
+  socket.emit('set_proxy', { profile: 'custom', custom_http: http||null, custom_socks: socks||null });
+}
+
+function showProxyTip(key) {
+  const tip = PROXIES[key]?.setup_tip;
+  const el  = document.getElementById('proxy-tip');
+  if (tip) { el.textContent = '💡 ' + tip; el.style.display = 'block'; }
+  else      { el.style.display = 'none'; }
+}
+
+function updateProxyPill(status) {
+  const pill  = document.getElementById('proxy-pill');
+  const dot   = document.getElementById('px-dot');
+  const label = document.getElementById('px-label');
+  if (!status || !status.active) {
+    pill.className = 'proxy-pill';
+    dot.className  = 'px-dot';
+    label.textContent = 'Sem proxy';
+  } else if (!status.reachable) {
+    pill.className = 'proxy-pill warn';
+    dot.className  = 'px-dot warn';
+    label.textContent = `${status.label} ⚠`;
+  } else {
+    pill.className = 'proxy-pill active';
+    dot.className  = 'px-dot on';
+    label.textContent = status.label;
+  }
+}
+
+function toggleProxySidebar() {
+  S.proxyShown = !S.proxyShown;
+  document.getElementById('proxy-sidebar').style.display = S.proxyShown ? '' : 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PIPELINES & STEPS
+// ═══════════════════════════════════════════════════════════════════
+function renderPipelines() {
+  const el = document.getElementById('pipe-list');
+  el.innerHTML = Object.entries(PIPELINES).map(([key, p]) => `
+    <div class="pipe-card ${S.selectedPreset===key?'sel':''}" id="pc-${key}"
+         style="--accent:${p.color}" onclick="selectPreset('${key}')">
+      <div class="ph"><span>${p.icon}</span><span class="pn">${p.label}</span></div>
+      <div class="pd">${p.desc}</div>
+      <div class="pcount">${p.stages?.reduce((a,s)=>a+s.tools.length,0)||0} ferramentas · ${p.stages?.length||0} estágios</div>
+    </div>`).join('');
+}
+
+function selectPreset(key) {
+  S.selectedPreset = S.selectedPreset === key ? null : key;
+  if (S.selectedPreset) {
+    // flatten all stages into sequential steps
+    S.steps = PIPELINES[key].stages.flatMap(stage =>
+      stage.tools.map(t => ({ tool: t, note: TOOLS[t]?.desc || '' }))
+    );
+  } else {
+    S.steps = [];
+  }
+  renderPipelines();
+  renderSteps();
+  updateRunBtn();
+}
+
+function renderSteps() {
+  const el = document.getElementById('step-list');
+  document.getElementById('step-count').textContent = S.steps.length;
+  if (!S.steps.length) {
+    el.innerHTML = '<div style="padding:10px;font-size:10px;color:var(--mu);text-align:center">Selecione um pipeline ou adicione ferramentas</div>';
+    return;
+  }
+  el.innerHTML = S.steps.map((s, i) => {
+    const t = TOOLS[s.tool];
+    if (!t) return '';
+    const ph = t.phase === 'recon' ? 'ph-recon' : 'ph-test';
+    const av = t.available ? '' : 'style="opacity:.4"';
+    return `<div class="step-item" id="si-${i}" ${av}>
+      <div class="sn" id="sn-${i}">${i+1}</div>
+      <div class="sb">
+        <div class="sl">${t.label}</div>
+        <div class="sd">${s.note || t.desc}</div>
+        <span class="sph ${ph}">${t.phase}</span>
+      </div>
+      <div class="sdel" onclick="removeStep(${i})">✕</div>
+    </div>`;
+  }).join('');
+}
+
+function addTool() {
+  const key = document.getElementById('add-sel').value;
+  if (!key) return;
+  S.selectedPreset = null;
+  document.querySelectorAll('.pipe-card').forEach(c => c.classList.remove('sel'));
+  S.steps.push({ tool: key, note: TOOLS[key]?.desc || '' });
+  renderSteps(); updateRunBtn();
+}
+
+function removeStep(i) {
+  S.steps.splice(i, 1);
+  renderSteps(); updateRunBtn();
+}
+
+function clearAll() {
+  S.steps = []; S.selectedPreset = null;
+  document.querySelectorAll('.pipe-card').forEach(c => c.classList.remove('sel'));
+  renderSteps(); updateRunBtn();
+}
+
+function renderAddSelect() {
+  const sel = document.getElementById('add-sel');
+  const cats = {};
+  for (const [k, t] of Object.entries(TOOLS)) {
+    if (!cats[t.category]) cats[t.category] = [];
+    cats[t.category].push({k, ...t});
+  }
+  let html = '<option value="">— adicionar —</option>';
+  for (const [cat, tools] of Object.entries(cats)) {
+    html += `<optgroup label="${cat}">`;
+    html += tools.map(t =>
+      `<option value="${t.k}" ${!t.available?'disabled':''}>
+        ${t.available?'✓':'✗'} ${t.label}</option>`
+    ).join('');
+    html += '</optgroup>';
+  }
+  sel.innerHTML = html;
+}
+
+// Step UI states
+function updateStep(idx, status) {
+  const item = document.getElementById('si-' + idx);
+  const num  = document.getElementById('sn-' + idx);
+  if (!item || !num) return;
+  item.classList.remove('running','done','si-running');
+  if (status === 'running') { item.classList.add('running','si-running'); }
+  else if (status === 'done') { item.classList.add('done'); num.textContent = '✓'; }
+  else if (status === 'warn') { item.classList.add('done'); num.textContent = '!'; }
+}
+
+function markAllDone() {
+  S.steps.forEach((_,i) => {
+    const item = document.getElementById('si-'+i);
+    if (item && !item.classList.contains('done')) item.classList.add('done');
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SCAN CONTROL
+// ═══════════════════════════════════════════════════════════════════
+function startScan() {
+  const target = document.getElementById('tgt').value.trim();
+  if (!target || !S.steps.length || S.running) return;
+  clearTerm(); S.followups = [];
+  // Build custom stages from flat step list
+  const stages = [{ id:'custom', name:'Custom', tools: S.steps.map(s=>s.tool), phase:'recon' }];
+  socket.emit('start_pipeline', {
+    target,
+    pipeline_key: S.selectedPreset,
+    custom_stages: S.selectedPreset ? null : stages,
+  });
+}
+
+function stopScan() {
+  if (S.scanId) socket.emit('cancel_scan', { scan_id: S.scanId });
+}
+
+function updateRunBtn() {
+  const t = document.getElementById('tgt').value.trim();
+  document.getElementById('run-btn').disabled = !(t && S.steps.length && !S.running);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHECKPOINT
+// ═══════════════════════════════════════════════════════════════════
+function showCheckpoint(data) {
+  S.checkpointData = data;
+  S.cpSelected = new Set(data.targets.map(t => t.value));
+  document.getElementById('cp-sub').textContent =
+    `${data.after_stage_name} → ${data.total} targets | próxima: ${data.next_stage}`;
+  document.getElementById('cp-next').textContent = `→ ${data.next_stage}`;
+  renderCpList();
+
+  // Followups
+  const fups = data.manual_followups || [];
+  const fupSec = document.getElementById('cp-followups-section');
+  const fupList = document.getElementById('cp-fup-list');
+  if (fups.length) {
+    fupList.innerHTML = fups.map(f =>
+      `<div class="cp-fup-item"><span>⚡</span>${f}</div>`).join('');
+    fupSec.style.display = '';
+  } else {
+    fupSec.style.display = 'none';
+  }
+
+  document.getElementById('cp-overlay').style.display = 'flex';
+}
+
+function hideCheckpoint() {
+  document.getElementById('cp-overlay').style.display = 'none';
+}
+
+function renderCpList() {
+  const list = document.getElementById('cp-list');
+  list.innerHTML = S.checkpointData.targets.map(t => {
+    const sel = S.cpSelected.has(t.value) ? 'sel' : '';
+    const tc = `t-${t.type}`;
+    return `<div class="cp-tgt ${sel}" onclick="cpToggle('${escH(t.value)}')">
+      <div class="cp-check">${sel ? '✓' : ''}</div>
+      <span class="cp-type ${tc}">${t.type}</span>
+      <span class="cp-val" title="${escH(t.value)}">${escH(t.label)}</span>
+    </div>`;
+  }).join('');
+  document.getElementById('cp-cnt').textContent = `${S.cpSelected.size} selecionados`;
+}
+
+function cpToggle(val) {
+  if (S.cpSelected.has(val)) S.cpSelected.delete(val);
+  else S.cpSelected.add(val);
+  renderCpList();
+}
+
+function cpAll() {
+  const all = S.checkpointData.targets.length;
+  if (S.cpSelected.size === all) S.cpSelected.clear();
+  else S.checkpointData.targets.forEach(t => S.cpSelected.add(t.value));
+  renderCpList();
+}
+
+function cpApprove() {
+  if (!S.cpSelected.size) { toast('Selecione pelo menos 1 target','warn'); return; }
+  const scopeRaw = (document.getElementById('scope')?.value || '').trim();
+  const scope = scopeRaw ? scopeRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  socket.emit('checkpoint_approve', {
+    scan_id: S.scanId,
+    approved_targets: [...S.cpSelected],
+    scope,
+  });
+  hideCheckpoint();
+}
+
+function cpSkip() {
+  socket.emit('cancel_scan', { scan_id: S.scanId });
+  hideCheckpoint();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COVERAGE CHECKLIST
+// ═══════════════════════════════════════════════════════════════════
+function renderChecklist() {
+  const body = document.getElementById('checklist-body');
+  body.innerHTML = Object.entries(CHECKLIST).map(([key, cat]) => {
+    const checks = cat.checks;
+    const done = (S.checkProgress[key] || []).filter(Boolean).length;
+    const pct = Math.round((done / checks.length) * 100);
+    return `
+      <div class="cov-section">
+        <div class="cov-hdr" onclick="toggleCovSection('${key}')">
+          <div class="cov-title">
+            <span class="cov-icon">${cat.icon}</span>
+            <span class="cov-label">${cat.label}</span>
+          </div>
+          <div class="cov-progress">
+            <div class="cov-bar"><div class="cov-fill" style="width:${pct}%"></div></div>
+            <span class="cov-pct">${done}/${checks.length}</span>
+          </div>
+        </div>
+        <div class="cov-body" id="cov-${key}">
+          ${checks.map((c,i) => {
+            const checked = (S.checkProgress[key]||[])[i] ? 'checked' : '';
+            return `<div class="check-item ${checked}" onclick="toggleCheck('${key}',${i})">
+              <div class="ci-box">${checked ? '✓' : ''}</div>
+              <div class="ci-text">${c}</div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function toggleCovSection(key) {
+  const body = document.getElementById('cov-' + key);
+  body.classList.toggle('open');
+}
+
+function toggleCheck(key, idx) {
+  if (!S.checkProgress[key]) S.checkProgress[key] = [];
+  S.checkProgress[key][idx] = !S.checkProgress[key][idx];
+  renderChecklist();
+}
+
+function renderFollowups() {
+  const fups = [...new Set(S.followups)];
+  const sec  = document.getElementById('followup-section');
+  const list = document.getElementById('followup-list');
+  if (!fups.length) { sec.style.display = 'none'; return; }
+  sec.style.display = '';
+  list.innerHTML = fups.map(f =>
+    `<div class="followup-item"><span class="fi-icon">⚡</span>${f}</div>`
+  ).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ACTION ITEMS
+// ═══════════════════════════════════════════════════════════════════
+async function loadActionItems(scanId) {
+  if (!scanId) return;
+  const data = await fetch(`/api/action_items/${scanId}`).then(r=>r.json()).catch(()=>null);
+  if (!data) return;
+  S.actionItems = data;  // cache — evita re-fetch no showPanel
+  renderActionItems(data);
+  // Badge na aba
+  const total = data.immediate.length + data.worth_testing.length;
+  const badge = document.getElementById('nb-act-badge');
+  badge.textContent = total;
+  badge.style.display = total ? 'inline-block' : 'none';
+  // Auto-mudar para a aba Ação se tiver imediatos (sem passar por showPanel→loadActionItems)
+  if (data.immediate.length > 0) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));
+    document.querySelectorAll('.nb').forEach(b => b.classList.remove('on'));
+    document.getElementById('panel-actions').classList.add('on');
+    document.getElementById('nb-actions').classList.add('on');
+  }
+}
+
+function renderActionItems(data) {
+  const wrap = document.getElementById('actions-wrap');
+  const stats = data.stats || {};
+  const totalFindings = stats.total || 0;
+  if (!totalFindings) {
+    wrap.innerHTML = '<div class="empty"><div class="ei">⚡</div><div class="et">Nenhum finding encontrado</div></div>';
+    return;
+  }
+
+  function renderSection(items, cls, label, icon) {
+    if (!items.length) return '';
+    const sid = data.scan_id;
+    const nVerif = items.filter(f => f.verifiable).length;
+    const batchCtl = nVerif > 1 ? `
+        <button class="vbtn" id="vall-${cls}" style="margin-left:auto"
+          onclick="verifyAll('${sid}','${cls}',this)">⚡ Verificar todos (${nVerif})</button>
+        <span class="vall-prog" id="vallp-${cls}"></span>` : '';
+    return `<div class="ai-section">
+      <div class="ai-section-hdr">
+        <span class="ai-sect-label ai-sect-${cls}">${icon} ${label}</span>
+        <span class="ai-count">${items.length}</span>
+        ${batchCtl}
+      </div>
+      ${items.map(f => `
+        <div class="ai-itemwrap">
+          <div class="ai-item ai-${cls}">
+            <div class="ai-main">
+              <div class="ai-name">${escH(f.name)}</div>
+              <div class="ai-badges" id="badges-${f.id}">
+                ${confBadge(f.confidence)}
+                ${vecBadge(f.ftype)}
+                <span style="font-size:8px;padding:1px 6px;border-radius:3px;
+                  background:rgba(0,0,0,.2);color:var(--mu2);border:1px solid var(--b1)">${escH(f.tool)}</span>
+              </div>
+              <div class="ai-meta">${f.target ? escH(f.target) + ' · ' : ''}${escH(f.ftype)}</div>
+            </div>
+            ${f.verifiable ? `<button class="vbtn" id="vbtn-${f.id}"
+              title="${escH(f.verify_desc||'')} (via ${escH(f.verify_tool||'')})"
+              onclick="doVerify('${sid}',${f.id},this)">⚡ Verificar</button>` : ''}
+          </div>
+          <div class="vres" id="vres-${f.id}" style="display:none"></div>
+        </div>`).join('')}
+    </div>`;
+  }
+
+  // Stats bar
+  const statsBar = `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <span class="sev-chip" style="color:#ff4d6d;border-color:#ff4d6d">confirmed <b>${stats.confirmed||0}</b></span>
+      <span class="sev-chip" style="color:var(--o);border-color:var(--o)">likely <b>${stats.likely||0}</b></span>
+      <span class="sev-chip" style="color:var(--mu2);border-color:var(--b2)">possible <b>${stats.possible||0}</b></span>
+      <span style="margin-left:auto;font-size:10px;color:var(--mu2);align-self:center">${totalFindings} findings total</span>
+    </div>`;
+
+  // Checklist relevante
+  const relCl = data.relevant_checklist || [];
+  const clBar = relCl.length ? `
+    <div style="margin-bottom:14px;padding:10px;background:var(--bg2);border:1px solid var(--b1);border-radius:6px">
+      <div style="font-size:9px;color:var(--mu2);margin-bottom:7px;text-transform:uppercase;letter-spacing:1px">
+        Checklist relevante para esta scan
+      </div>
+      <div class="ai-checklist" style="margin-top:0;padding-top:0;border:none">
+        ${relCl.map(k => `<span class="ai-cl-chip" onclick="showPanel('coverage')">${k}</span>`).join('')}
+      </div>
+    </div>` : '';
+
+  wrap.innerHTML =
+    statsBar +
+    clBar +
+    renderSection(data.immediate, 'imm', 'Testar agora', '🔴') +
+    renderSection(data.worth_testing, 'worth', 'Vale testar', '🟡') +
+    renderSection(data.optional, 'opt', 'Opcional', '⬛');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// VERIFICACAO ATIVA
+// ═══════════════════════════════════════════════════════════════════
+async function doVerify(scanId, findingId, btn) {
+  btn.disabled = true;
+  const oldLabel = btn.textContent;
+  btn.textContent = '⏳ Verificando...';
+  const box = document.getElementById('vres-' + findingId);
+
+  let res;
+  try {
+    res = await fetch(`/api/verify/${scanId}/${findingId}`, {method:'POST'})
+            .then(r => r.json());
+  } catch (e) {
+    res = {ok:false, error:'Falha de rede: ' + e.message};
+  }
+
+  if (box) {
+    const cmd = (res.cmd || []).join(' ');
+    if (res.ok && res.verified) {
+      box.className = 'vres ok';
+      box.innerHTML = `<div class="vres-hdr" style="color:var(--g)">✓ CONFIRMADO via ${escH(res.tool||'')}</div>`
+        + (cmd ? `<pre>$ ${escH(cmd)}\n\n${escH(res.output||'')}</pre>` : `<pre>${escH(res.output||'')}</pre>`);
+    } else if (res.ok && !res.verified) {
+      box.className = 'vres';
+      box.innerHTML = `<div class="vres-hdr" style="color:var(--o)">⚠ Sem confirmacao (${escH(res.tool||'')})</div>`
+        + `<pre>$ ${escH(cmd)}\n\n${escH(res.output||'(sem output)')}</pre>`;
+    } else {
+      box.className = 'vres fail';
+      box.innerHTML = `<div class="vres-hdr" style="color:#ff4d6d">✗ ${escH(res.error||'Erro na verificacao')}</div>`;
+    }
+    box.style.display = 'block';
+  }
+
+  // Atualiza badge de confidence ao confirmar + atualiza cache
+  if (res.ok && res.verified) {
+    btn.className = 'vbtn ok';
+    btn.textContent = '✓ Confirmado';
+    const badges = document.getElementById('badges-' + findingId);
+    if (badges) {
+      const cb = badges.querySelector('.cb');
+      if (cb) { cb.className = 'cb cb-confirmed'; cb.textContent = 'confirmed'; }
+    }
+    if (S.actionItems) {
+      ['immediate','worth_testing','optional'].forEach(k => {
+        (S.actionItems[k]||[]).forEach(f => { if (f.id === findingId) f.confidence = 'confirmed'; });
+      });
+    }
+    btn.disabled = true;
+  } else {
+    btn.className = res.ok ? 'vbtn' : 'vbtn fail';
+    btn.textContent = res.ok ? '↻ Re-verificar' : oldLabel;
+    btn.disabled = false;
+  }
+  return res;
+}
+
+// Verificacao em lote — roda sequencialmente os findings verificaveis da secao
+async function verifyAll(scanId, cls, btn) {
+  const map = {imm:'immediate', worth:'worth_testing', opt:'optional'};
+  const list = (S.actionItems && S.actionItems[map[cls]]) || [];
+  const targets = list.filter(f => f.verifiable && f.confidence !== 'confirmed');
+  if (!targets.length) { return; }
+  btn.disabled = true;
+  const oldTxt = btn.textContent;
+  const prog = document.getElementById('vallp-' + cls);
+  let done = 0, confirmed = 0;
+  for (const f of targets) {
+    done++;
+    if (prog) prog.textContent = `verificando ${done}/${targets.length}…`;
+    btn.textContent = `⏳ ${done}/${targets.length}`;
+    const b = document.getElementById('vbtn-' + f.id);
+    if (!b) continue;
+    const res = await doVerify(scanId, f.id, b);
+    if (res && res.ok && res.verified) confirmed++;
+  }
+  if (prog) prog.textContent = `✓ ${confirmed}/${targets.length} confirmados`;
+  btn.textContent = '↻ Re-verificar todos';
+  btn.disabled = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FINDINGS FROM DB
+// ═══════════════════════════════════════════════════════════════════
+async function loadFindingsFromDB(scanId) {
+  const data = await fetch(`/api/findings/${scanId}`).then(r=>r.json()).catch(()=>[]);
+  if (!data.length) { renderFindBar(); renderFindings(); return; }
+  S.findings = data;
+  // Reconstruir summary a partir dos dados
+  const counts = {};
+  data.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
+  S.findSummary = { severity: counts };
+  renderFindBar();
+  renderFindings();
+  updateFindBadge();
+}
+
+async function loadScanToUI(scanId) {
+  S.lastScanId = scanId;
+  await loadFindingsFromDB(scanId);
+  await loadActionItems(scanId);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RESULTS
+// ═══════════════════════════════════════════════════════════════════
+async function loadResults() {
+  const data = await fetch('/api/results').then(r => r.json()).catch(() => []);
+  const wrap = document.getElementById('results-wrap');
+  if (!data.length) {
+    wrap.innerHTML = '<div class="empty"><div class="ei">◈</div><div class="et">Sem resultados</div></div>';
+    return;
+  }
+  wrap.innerHTML = data.map(r => `
+    <div class="rc">
+      <div class="rc-h" onclick="toggleResult('${r.scan_id}')" style="cursor:pointer">
+        <span class="rc-t">${r.target}</span>
+        <span class="rc-id">${r.scan_id}</span>
+      </div>
+      <div class="rc-meta" style="flex-wrap:wrap;gap:5px">
+        <span>${new Date(r.timestamp).toLocaleString('pt-BR')}</span>
+        ${r.proxy && r.proxy !== 'none' ? `<span class="px-badge">${r.proxy}</span>` : ''}
+      </div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px">
+        <button class="btn btn-gh" style="font-size:9px;padding:3px 9px"
+          onclick="event.stopPropagation();loadScanToUI('${r.scan_id}').then(()=>showPanel('findings'))">
+          ⚑ Findings
+        </button>
+        <button class="btn btn-gh" style="font-size:9px;padding:3px 9px;color:var(--o);border-color:rgba(255,184,108,.25)"
+          onclick="event.stopPropagation();loadScanToUI('${r.scan_id}').then(()=>showPanel('actions'))">
+          ⚡ Ação
+        </button>
+        <a href="/api/report/${r.scan_id}" class="px-badge" style="text-decoration:none;cursor:pointer"
+           onclick="event.stopPropagation()" download>⬇ HTML</a>
+        <a href="/api/report/${r.scan_id}?fmt=md" class="px-badge" style="text-decoration:none;cursor:pointer"
+           onclick="event.stopPropagation()" download>.md</a>
+        <a href="/api/export/${r.scan_id}?fmt=csv" class="px-badge" style="text-decoration:none;cursor:pointer;color:var(--g);border-color:rgba(0,255,136,.25)"
+           onclick="event.stopPropagation()" download>.csv</a>
+        <a href="/api/export/${r.scan_id}?fmt=json" class="px-badge" style="text-decoration:none;cursor:pointer;color:var(--y);border-color:rgba(241,250,140,.25)"
+           onclick="event.stopPropagation()" download>.json</a>
+      </div>
+      <div class="rc-body" id="rcb-${r.scan_id}"></div>
+    </div>`).join('');
+}
+
+async function toggleResult(id) {
+  const body = document.getElementById('rcb-' + id);
+  if (body.style.display === 'block') { body.style.display = 'none'; return; }
+  if (!body.textContent.trim()) {
+    const d = await fetch(`/api/results/${id}`).then(r => r.json());
+    let txt = '';
+    for (const [stage, tools] of Object.entries(d.results || {})) {
+      txt += `\n══ ${stage} ══\n`;
+      for (const [tool, raw] of Object.entries(tools)) {
+        if (raw) txt += `\n── ${tool} ──\n${raw}\n`;
+      }
+    }
+    body.textContent = txt || 'Sem output';
+  }
+  body.style.display = 'block';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════════════════════════════
+function tlog(cls, text) {
+  const b = document.getElementById('tbody');
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = text;
+  b.appendChild(d);
+  scrollTerm();
+}
+function scrollTerm() {
+  const b = document.getElementById('tbody');
+  b.scrollTop = b.scrollHeight;
+}
+function clearTerm() { document.getElementById('tbody').innerHTML = ''; }
+function setProgress(p) { document.getElementById('prog').style.width = Math.min(100,p)+'%'; }
+function setRunSt(m) { document.getElementById('run-st').textContent = m; }
+function setConn(on) {
+  document.getElementById('conn-dot').className = 'conn-dot'+(on?' on':'');
+  document.getElementById('conn-txt').textContent = on ? 'online' : 'offline';
+}
+function showPanel(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));
+  document.querySelectorAll('.nb').forEach(b => b.classList.remove('on'));
+  document.getElementById('panel-'+name).classList.add('on');
+  document.getElementById('nb-'+name).classList.add('on');
+  if (name === 'results') loadResults();
+  if (name === 'coverage') { renderChecklist(); renderFollowups(); }
+  if (name === 'findings') {
+    if (!S.findings.length && S.lastScanId) loadFindingsFromDB(S.lastScanId);
+    else { renderFindBar(); renderFindings(); }
+  }
+  if (name === 'actions') {
+    if (S.actionItems) renderActionItems(S.actionItems);
+    else if (S.lastScanId) loadActionItems(S.lastScanId);
+  }
+}
+
+const SEV_ORDER = ['critical','high','medium','low','info','unknown'];
+const SEV_RANK = {critical:5,high:4,medium:3,low:2,info:1,unknown:0};
+
+function updateFindBadge() {
+  const b = document.getElementById('nb-find-badge');
+  const n = S.findings.length;
+  b.textContent = n;
+  b.style.display = n ? 'inline-block' : 'none';
+}
+function renderFindBar() {
+  const bar = document.getElementById('fnd-bar');
+  const scanLabel = S.lastScanId ? `<span style="font-size:9px;color:var(--mu2);margin-left:auto">scan ${S.lastScanId}</span>` : '';
+  const sev = (S.findSummary && S.findSummary.severity) || {};
+  // fallback: conta a partir da lista local se não houver summary
+  const counts = {};
+  SEV_ORDER.forEach(s => counts[s] = sev[s] || 0);
+  if (!S.findSummary) S.findings.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
+  bar.innerHTML = (SEV_ORDER.filter(s => counts[s] > 0).map(s =>
+    `<span class="sev-chip sev-${s}" style="color:var(--sc);border-color:var(--sc)">
+       ${s} <b>${counts[s]}</b></span>`).join('') ||
+    '<span style="font-size:10px;color:var(--mu2)">Nenhum finding ainda.</span>') + scanLabel;
+}
+const FTYPE_VECTOR_UI = {
+  sqli:'injection',cmdi:'injection',ssti:'injection',xxe:'injection',
+  xss:'web-client',cors:'web-client',csrf:'web-client',open_redirect:'web-client',
+  ssl:'crypto',cert:'crypto',auth:'auth',jwt:'auth',oauth:'auth',
+  port:'network',service:'network',subdomain:'network',ip:'network',host:'network',
+  secret:'disclosure',info:'disclosure',
+  vuln:'vuln',cve:'vuln',rce:'vuln',lfi:'vuln',ssrf:'vuln',
+  cloud:'cloud',bypass:'access',idor:'access',api:'api',
+};
+function confBadge(c) {
+  const map = {confirmed:'cb-confirmed',likely:'cb-likely',possible:'cb-possible'};
+  return `<span class="cb ${map[c]||'cb-possible'}">${c||'possible'}</span>`;
+}
+function vecBadge(ftype) {
+  const v = FTYPE_VECTOR_UI[ftype];
+  return v ? `<span class="vb">${v}</span>` : '';
+}
+function renderFindings() {
+  const wrap = document.getElementById('fnd-list');
+  if (!S.findings.length) {
+    wrap.innerHTML = '<div class="empty"><div class="ei">⚑</div><div class="et">Sem findings ainda — inicie uma scan</div></div>';
+    return;
+  }
+  const sorted = [...S.findings].sort((a,b) =>
+    (SEV_RANK[b.severity]||0) - (SEV_RANK[a.severity]||0));
+  wrap.innerHTML = sorted.map(f => `
+    <div class="fnd-row sev-${f.severity}">
+      <span class="fnd-tag sev-${f.severity}" style="background:var(--sc)">${f.severity}</span>
+      <div style="flex:1">
+        <div class="fnd-name">${escH(f.name)}</div>
+        <div class="ai-badges" style="margin-top:3px">
+          ${confBadge(f.confidence)}
+          ${vecBadge(f.ftype)}
+        </div>
+        <div class="fnd-meta">${escH(f.tool)} · ${escH(f.ftype)}${f.target ? ' · ' + escH(f.target) : ''}</div>
+      </div>
+    </div>`).join('');
+}
+function toast(msg, type='ok') {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = `toast ${type} show`;
+  setTimeout(() => t.classList.remove('show'), 2800);
+}
+function escH(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════
+renderProxyGrid();
+renderPipelines();
+renderSteps();
+renderAddSelect();
+renderChecklist();
+loadResults();
+</script>
+</body>
+</html>

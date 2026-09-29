@@ -1,0 +1,23 @@
+@"
+__pycache__/
+*.py[cod]
+
+*.bak
+*.bak.*
+files.zip
+zibybLF3
+
+results/
+*.db
+*.sqlite
+*.sqlite3
+
+.env
+.env.*
+!.env.example
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+"@ | Set-Content -LiteralPath ".gitignore" -Encoding utf8
