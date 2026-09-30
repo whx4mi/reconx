@@ -8,13 +8,17 @@ antes dos testes gerais. Também é possível selecionar a ferramenta
 A etapa busca HTML a partir do alvo original e das URLs já descobertas,
 segue links da mesma origem (esquema, host e porta) e identifica formulários,
 campos de texto, textarea, select, campos ocultos, tokens e parâmetros na URL.
-Ela preserva os caminhos, query strings e campos duplicados.
+Também reconhece requisições `fetch()` literais construídas com
+`URLSearchParams` em scripts inline, sem executar o JavaScript. Ela preserva
+os caminhos, query strings e campos duplicados.
 
 URLs parametrizadas recebem testes SQLMap/Dalfox. Formulários GET/POST
 recebem testes com os nomes e valores dos campos, botão de envio e cookies
 da descoberta. Antes de cada teste o formulário é lido novamente; SQLMap
 recebe instruções de renovação de CSRF quando há token conhecido. Login
 recebe teste de injection, mas sua detecção não confirma bypass de autenticação.
+Requisições POST simples descobertas em scripts inline recebem SQLMap e Commix
+com o corpo e os nomes de parâmetros observados.
 
 Limites atuais: 12 páginas, profundidade 2, corpo de até 512 KiB por página
 e 12 tarefas de teste. Cada scanner também tem o timeout definido no catálogo.
@@ -34,8 +38,9 @@ integra o JSON final do scan. Estados:
 
 Pendências explícitas incluem uploads, formulários com potencial de exclusão,
 actions fora da origem inicial e XSS com token dinâmico. A camada interpreta
-HTML estático; não automatiza fluxos de navegador/SPA, MFA, CAPTCHA,
-bypass lógico ou sessões autenticadas fornecidas pelo usuário.
+HTML e padrões simples de scripts inline; não interpreta JavaScript arbitrário,
+bundles externos ou valores calculados, nem automatiza fluxos de navegador/SPA,
+MFA, CAPTCHA, bypass lógico ou sessões autenticadas fornecidas pelo usuário.
 
 ## Wordlists e testes de login
 

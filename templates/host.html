@@ -31,7 +31,7 @@
   <main class="wrap">
     <div id="loading" class="muted">Carregando perfil...</div>
     <div id="profile" hidden>
-      <div class="lead"><div><h1 id="host-name"></h1><div id="phase" class="muted"></div></div><div id="updated" class="muted small"></div></div>
+      <div class="lead"><div><h1 id="host-name"></h1><div id="phase" class="muted"></div></div><div><label class="small muted" for="scan-filter">Visão do scan</label><select id="scan-filter"></select><div id="updated" class="muted small"></div></div></div>
       <div id="stats" class="grid"></div>
       <div class="notice">Os próximos passos são sugestões baseadas nos dados observados. Nenhuma ação é executada automaticamente; revise o escopo antes de iniciar outro pipeline. Ferramenta concluída não significa teste validado.</div>
       <section class="card"><h2>Recomendações para este host</h2><div id="recommendations" class="cards"></div></section>
@@ -50,6 +50,8 @@
     const phaseLabels = {recon_inicial:'Recon inicial',recon_segmentado:'Recon segmentado',revisao_manual:'Recon + revisão manual'};
     const statusLabels = {pending:'Pendente',in_progress:'Em andamento',tested:'Testado',inconclusive:'Inconclusivo',not_applicable:'Não aplicável'};
     const webPorts = [80,443,8000,8008,8080,8081,8443,8888,3000,5000];
+    let profileData = null;
+    let selectedScan = null;
     const el = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     function notify(message, error=false) {
@@ -73,12 +75,21 @@
       return `/?${params.toString()}`;
     }
     function render(profile) {
+      profileData = profile;
+      if (selectedScan === null) selectedScan = profile.scans[0]?.scan_id || '';
+      const findings = selectedScan ? profile.findings.filter(item => item.scan_id === selectedScan) : profile.findings;
+      const runs = selectedScan ? profile.runs.filter(item => item.scan_id === selectedScan) : profile.runs;
+      const services = selectedScan ? profile.services.filter(item => item.scan_id === selectedScan) : profile.services;
       el('loading').hidden = true; el('profile').hidden = false;
       el('host-name').textContent = profile.host;
       document.title = `${profile.host} · ReconX`;
       el('phase').textContent = `Etapa sugerida: ${phaseLabels[profile.phase] || profile.phase}`;
       el('updated').textContent = `Atualizado: ${profile.updated_at || '—'}`;
-      const values = [['Scans',profile.scans.length],['Execuções recentes',profile.runs.length],['Serviços',profile.services.length],['Achados atribuídos',profile.findings.length]];
+      el('scan-filter').innerHTML = `<option value="">Todo o histórico</option>` + profile.scans.map(scan =>
+        `<option value="${esc(scan.scan_id)}" ${scan.scan_id === selectedScan ? 'selected' : ''}>${esc(scan.scan_id)} · ${esc(scan.pipeline || 'Custom')} · ${esc(scan.status || '')}</option>`).join('');
+      const gaps = runs.filter(item => ['failed','skipped'].includes(item.status)).length;
+      const confirmed = findings.filter(item => item.confidence === 'confirmed').length;
+      const values = [['Scans',profile.scans.length],['Achados nesta visão',findings.length],['Confirmados',confirmed],['Falhas/lacunas',gaps]];
       el('stats').innerHTML = values.map(([label,value]) => `<div class="stat"><strong>${value}</strong>${label}</div>`).join('');
       el('recommendations').innerHTML = profile.recommendations.length ? profile.recommendations.map(rec => `
         <div class="row"><h3>${esc(rec.title)}</h3><p class="small muted">${esc(rec.reason)}</p>
@@ -88,14 +99,14 @@
         <div class="row"><div class="row-head"><h3>${esc(labels[s.key] || s.key)}</h3><span class="tag ${s.ready ? '' : 'warn'}">${s.ready ? 'Disponível' : 'Aguardando evidência'}</span></div>
         <p class="small muted">${esc(s.reason)}</p>
         ${s.ready ? `<a class="action" href="${esc(pipelineLink(profile,s.key))}" target="_blank" rel="noopener">Preparar no ReconX ↗</a>` : ''}</div>`).join('');
-      el('findings').innerHTML = profile.findings.length ? profile.findings.map(f => `
+      el('findings').innerHTML = findings.length ? findings.map(f => `
         <div class="row"><div class="row-head"><h3>${esc(f.name)}</h3><span class="tag ${['critical','high'].includes(f.severity) ? 'bad' : 'warn'}">${esc(f.severity)}</span></div>
           <div class="small muted">${esc(f.tool)} · ${esc(f.confidence)} · ${esc(f.target)} · scan ${esc(f.scan_id)}</div>
           ${f.evidence ? `<details><summary>Ver evidência</summary><div class="pre small">${esc(f.evidence)}</div></details>` : ''}</div>`).join('') : '<p class="muted">Nenhum achado com alvo explícito atribuído a este host. Consulte também os outputs brutos.</p>';
-      el('services').innerHTML = profile.services.length ? profile.services.map(s => `<div class="row">${Number(s.port)}/${esc(s.protocol)} · ${esc(s.service)} <span class="small muted">· scan ${esc(s.scan_id)}</span></div>`).join('') : '<p class="muted">Nenhum serviço observado.</p>';
-      el('assets').innerHTML = profile.assets.length ? profile.assets.map(a => `<div class="row"><span class="tag">${esc(a.atype)}</span> ${esc(a.value)}</div>`).join('') : '<p class="muted">Nenhum ativo observado.</p>';
+      el('services').innerHTML = services.length ? services.map(s => `<div class="row">${Number(s.port)}/${esc(s.protocol)} · ${esc(s.service || 'serviço não identificado')} <span class="small muted">· scan ${esc(s.scan_id)}</span></div>`).join('') : '<p class="muted">Nenhum serviço observado nesta visão.</p>';
+      el('assets').innerHTML = profile.assets.length ? `<p class="small muted">Inventário acumulado do host (todos os scans).</p>` + profile.assets.map(a => `<div class="row"><span class="tag">${esc(a.atype)}</span> ${esc(a.value)}</div>`).join('') : '<p class="muted">Nenhum ativo observado.</p>';
       el('scans').innerHTML = profile.scans.length ? profile.scans.map(s => `<div class="row"><div class="row-head"><strong>${esc(s.pipeline || 'Custom')}</strong><span class="tag">${esc(s.status || 'desconhecido')}</span></div><div class="small muted">${esc(s.started_at || '')} · ${esc(s.target || '')}</div><a href="/api/results/${encodeURIComponent(s.scan_id)}" target="_blank" rel="noopener">Abrir resultado ${esc(s.scan_id)} ↗</a></div>`).join('') : '<p class="muted">Nenhuma scan executada.</p>';
-      el('runs').innerHTML = profile.runs.length ? profile.runs.map(r => `<div class="row"><div class="row-head"><strong>${esc(r.tool)}</strong><span class="tag ${r.status === 'failed' ? 'bad' : r.status === 'skipped' ? 'warn' : ''}">${esc(r.status)}</span></div><div class="small muted">${esc(r.created_at)} · ${esc(r.target)} · scan ${esc(r.scan_id)}</div>${r.output_path ? `<a href="/api/hosts/${hostId}/runs/${Number(r.id)}/output" target="_blank" rel="noopener">Ver output bruto ↗</a>` : ''}</div>`).join('') : '<p class="muted">Nenhuma execução registrada.</p>';
+      el('runs').innerHTML = runs.length ? runs.map(r => `<div class="row"><div class="row-head"><strong>${esc(r.tool)}</strong><span class="tag ${r.status === 'failed' ? 'bad' : r.status === 'skipped' ? 'warn' : ''}">${esc(r.status)}</span></div><div class="small muted">${esc(r.created_at)} · ${esc(r.target)} · scan ${esc(r.scan_id)}</div>${r.output_path ? `<a href="/api/hosts/${hostId}/runs/${Number(r.id)}/output" target="_blank" rel="noopener">Ver output bruto ↗</a>` : ''}</div>`).join('') : '<p class="muted">Nenhuma execução registrada nesta visão.</p>';
       el('checks').innerHTML = profile.checks.map(c => `<div class="check" data-key="${esc(c.check_key)}"><h3>${esc(c.label)}</h3><div class="check-grid"><select class="check-status">${Object.entries(statusLabels).map(([value,label]) => `<option value="${value}" ${value === c.status ? 'selected' : ''}>${label}</option>`).join('')}</select><textarea class="check-note" maxlength="2000" placeholder="Observação">${esc(c.note)}</textarea><textarea class="check-evidence" maxlength="2000" placeholder="Referência da evidência">${esc(c.evidence)}</textarea><button class="check-save">Salvar</button></div></div>`).join('');
       el('checks').querySelectorAll('.check-save').forEach(button => button.addEventListener('click', () => saveCheck(button.closest('.check'))));
     }
@@ -117,6 +128,7 @@
       } catch (error) { notify(error.message,true); }
     }
     el('refresh').addEventListener('click', loadProfile);
+    el('scan-filter').addEventListener('change', event => { selectedScan = event.target.value; render(profileData); });
     loadProfile();
   </script>
 </body>

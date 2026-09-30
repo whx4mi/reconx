@@ -86,6 +86,15 @@ class HostProfilesTests(unittest.TestCase):
         self.assertTrue(next(s for s in profile['suggestions'] if s['key'] == 'web_recon')['ready'])
         self.assertFalse(next(s for s in profile['suggestions'] if s['key'] == 'api_recon')['ready'])
 
+    def test_naabu_does_not_erase_nmap_service_name(self):
+        host_id = self.store.ensure('lab.example', 's1')
+        self.store.record_services('s1', 'lab.example', 'nmap_quick',
+                                   '80/tcp open  http\n22/tcp open ssh')
+        self.store.record_services('s1', 'lab.example', 'naabu',
+                                   '{"ip":"192.0.2.10","port":80,"protocol":"tcp"}')
+        services = {item['port']: item['service'] for item in self.store.get(host_id)['services']}
+        self.assertEqual(services[80], 'http')
+
     def test_httpx_observation_is_attributed_to_observed_host(self):
         first = self.store.ensure('first.example')
         second = self.store.ensure('second.example')

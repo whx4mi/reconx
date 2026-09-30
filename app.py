@@ -107,11 +107,42 @@ def db_finish_scan(scan_id, status='done'):
         c.execute("UPDATE scans SET status=?, finished_at=? WHERE scan_id=?",
                   (status, datetime.now().isoformat(), scan_id))
 
+def _finding_identity(tool, ftype, name, target):
+    """Collapse scanner aliases that describe the same vulnerable input."""
+    if ftype in ('xss', 'open_redirect') and target:
+        try:
+            parsed = urlsplit(target)
+            path = re.sub(r'/index\.php$', '/', parsed.path, flags=re.I)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            suspicious = [key for key, value in pairs if re.search(
+                r'(?i)(?:<svg|onload|onfocus|onclick|class=dlx|oast\.me|^//|^https?://)', value)]
+            parameters = suspicious or [key for key, _ in pairs]
+            if parameters:
+                origin = f'{parsed.scheme.lower()}://{parsed.netloc.lower()}'
+                return f'{ftype}|{origin}|{path}|{",".join(sorted(set(parameters)))}'
+        except (TypeError, ValueError):
+            pass
+    return f'{tool}|{ftype}|{name}|{target}'
+
+
 def db_add_finding(scan_id, tool, ftype, name, severity, target, evidence, confidence='possible'):
     severity = severity if severity in SEVERITIES else 'unknown'
     confidence = confidence if confidence in ('confirmed', 'likely', 'possible') else 'possible'
-    dedup = hashlib.sha1(f"{tool}|{ftype}|{name}|{target}".encode(), usedforsecurity=False).hexdigest()
+    identity = _finding_identity(tool, ftype, name, target)
+    dedup = hashlib.sha1(identity.encode(), usedforsecurity=False).hexdigest()
     with _db_lock, _db() as c:
+        previous = c.execute(
+            'SELECT id,confidence FROM findings WHERE scan_id=? AND dedup_key=?',
+            (scan_id, dedup)).fetchone()
+        if previous:
+            rank = {'possible': 0, 'likely': 1, 'confirmed': 2}
+            if rank[confidence] > rank.get(previous['confidence'], 0):
+                c.execute('''UPDATE findings SET tool=?,ftype=?,name=?,severity=?,target=?,
+                    evidence=?,confidence=? WHERE id=?''',
+                    (tool, ftype, name, severity, target, (evidence or '')[:2000],
+                     confidence, previous['id']))
+                return True, previous['id']
+            return False, previous['id']
         cur = c.execute("""INSERT OR IGNORE INTO findings
             (scan_id,tool,ftype,name,severity,target,evidence,created_at,dedup_key,confidence)
             VALUES(?,?,?,?,?,?,?,?,?,?)""",
@@ -1548,19 +1579,27 @@ def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
         return None, str(e)
 
     if request_context:
-        if tool_key not in ('sqlmap_url', 'dalfox_url'):
+        if tool_key not in ('sqlmap_url', 'dalfox_url', 'commix'):
             return None, 'Contexto de formulário não suportado por esta ferramenta'
         if request_context.get('data') is not None:
-            cmd += ['--data', request_context['data']]
+            if tool_key == 'commix':
+                cmd += ['--data=' + request_context['data']]
+            else:
+                cmd += ['--data', request_context['data']]
         if request_context.get('cookie'):
             # Dalfox v3 uses --cookies; sqlmap uses the singular --cookie.
-            cmd += ['--cookies' if tool_key == 'dalfox_url' else '--cookie',
-                    request_context['cookie']]
+            if tool_key == 'commix':
+                cmd += ['--cookie=' + request_context['cookie']]
+            else:
+                cmd += ['--cookies' if tool_key == 'dalfox_url' else '--cookie',
+                        request_context['cookie']]
         params = request_context.get('parameters', [])
         if params:
             if tool_key == 'dalfox_url':
                 for param in dict.fromkeys(params):
                     cmd += ['-p', param]
+            elif tool_key == 'commix':
+                cmd += ['-p', ','.join(dict.fromkeys(params))]
             else:
                 cmd += ['-p', ','.join(dict.fromkeys(params))]
         if tool_key == 'sqlmap_url':
@@ -1735,6 +1774,14 @@ _HI_RE  = re.compile(r'cve-\d{4}-\d+|critical|\brce\b|sql injection|injectable|v
 _MED_RE = re.compile(r'\bvuln\b|exploit|default cred|traversal|disclos|exposed|admin panel|takeover', re.I)
 _LOW_RE = re.compile(r'missing|header|outdated|deprecated|insecure|weak', re.I)
 _NOISE_RE = re.compile(r'^[\s_|\\/`*~()\-=+]+$')
+_SQLI_POSITIVE_RE = re.compile(
+    r'sqlmap identified the following injection point|'
+    r'(?:GET|POST|Cookie|URI\s+)?parameter\s+.+(?:is vulnerable|appears to be.+injectable)|'
+    r'\bparameter\s+.+\bis injectable\b', re.I)
+_CMDI_POSITIVE_RE = re.compile(
+    r'(?:parameter|HTTP header)\s+.+(?:appears to be injectable|is vulnerable)|'
+    r'(?:OS command|command) injection (?:point|was identified|confirmed)|'
+    r'payload.+(?:executed|execution succeeded)', re.I)
 
 def _parse_wafw00f(tool_key, raw_text, target):
     """Parser dedicado para wafw00f — emite 1 finding por WAF detectado."""
@@ -1838,10 +1885,11 @@ _TOOL_NOISE = {
         r'\[WARNING\](?!.*(?:injectable|vulnerable))|'
         r'all tested parameters do not appear|not injectable|not vulnerable|'
         r'(?:might|does).*not.*injectable|'
+        r'heuristic \(XSS\) test|'
         r'recommended to perform only basic UNION tests|do you want to reduce the number of requests|'
         r'\[CRITICAL\].*(?:timed out|connection|Unable)|'
         r'got a 3\d\d redirect|'
-        r'you have not declared cookie|'
+        r'you have not declared cookie|provided a HTTP Cookie header value|merge them|'
         r'do you want to (follow|use those|ignore)',
         re.I
     ),
@@ -1854,7 +1902,7 @@ _TOOL_NOISE = {
         r'\[info\].*(?:Testing connection|Following redirect|Checking whether|Skipping further)|'
         r'^\s*\[[\*]\].*(?:Testing connection|Checking|Skipping)|'
         r'\[warning\]|'
-        r'\[critical\].*(?:timed out|Unable to connect)|'
+        r'\[critical\].*(?:timed out|Unable to connect|No parameter\(s\) found|not vulnerable|not injectable)|'
         r'Got a 3\d\d redirect|'
         r'You have not declared|'
         r'Do you want to|'
@@ -1872,7 +1920,7 @@ _TOOL_NOISE = {
     ),
 }
 
-def _text_findings(tool_key, otype, lines):
+def _text_findings(tool_key, otype, lines, target=''):
     if otype not in ('ports','nikto','cves','misconfig','sqli','xss','cmdi',
                      'tech_vuln','wordpress'):
         return []  # 'waf' removido — tratado por _parse_wafw00f
@@ -1889,11 +1937,22 @@ def _text_findings(tool_key, otype, lines):
         if not re.search(r'[a-zA-Z]', l): continue
         _tnoise = _TOOL_NOISE.get(otype)
         if _tnoise and _tnoise.search(l): continue
+        # Injection tools are verbose and use words such as "injection" in
+        # banners, tested technique names and prompts. Only their explicit
+        # positive result language is eligible to become a finding.
+        if otype == 'sqli' and not _SQLI_POSITIVE_RE.search(l): continue
+        if otype == 'cmdi' and not _CMDI_POSITIVE_RE.search(l): continue
+        # Nikto metadata/status lines begin with the same '+' prefix as real
+        # tests. Keep only identified checks and discard its explicit warning
+        # that the result itself may cause false positives.
+        if otype == 'nikto':
+            if not re.match(r'^\+\s+\[(?:\d{6}|CVE-|OSVDB-)', l, re.I): continue
+            if re.search(r'may cause false positives', l, re.I): continue
         if   _HI_RE.search(l):  sev = 'high'
         elif _MED_RE.search(l): sev = 'medium'
         elif _LOW_RE.search(l): sev = 'low'
         else:                   sev = 'info'
-        out.append(_finding(tool_key, otype, l[:160], sev, '', l[:300]))
+        out.append(_finding(tool_key, otype, l[:160], sev, target, l[:300]))
     return out
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2091,9 +2150,27 @@ def run_verification(finding):
             cmd, capture_output=True, text=True,
             timeout=VERIFY_TIMEOUT, env=proxy_env(proxy=proxy),
         )
-        out = strip_ansi((result.stdout or '') + (result.stderr or ''))
-        out = out.strip()[:VERIFY_MAX_OUTPUT]
-        verified = bool(re.search(entry['success'], out, re.I))
+        full_output = strip_ansi((result.stdout or '') + (result.stderr or '')).strip()
+        out = full_output[:VERIFY_MAX_OUTPUT]
+        if entry['id'] == 'xss':
+            candidates = []
+            for line in full_output.splitlines():
+                if not re.search(r'\[POC\]\[V\]', line, re.I):
+                    continue
+                match = re.search(r'https?://\S+', line)
+                if match:
+                    candidates.append(match.group(0))
+            working_url = next((working for candidate in candidates
+                                if (working := browser_validate_xss(candidate))), None)
+            verified = bool(working_url)
+            if working_url:
+                out = (out + '\nChromium executou JavaScript e registrou '
+                       f'data-reconx-xss=executed\nURL validada: {working_url}')[:VERIFY_MAX_OUTPUT]
+            elif candidates:
+                out = (out + '\nDalfox encontrou candidato, mas não houve execução '
+                       'confirmada no Chromium.')[:VERIFY_MAX_OUTPUT]
+        else:
+            verified = bool(re.search(entry['success'], out, re.I))
         return {
             'ok': True, 'verified': verified,
             'tool': tool_bin, 'verify_id': entry['id'],
@@ -2183,7 +2260,45 @@ def validate_dalfox_findings(findings):
     return findings
 
 
-def parse_output(tool_key, raw):
+def _nuclei_json_finding(tool_key, otype, record):
+    info = record.get('info') or {}
+    template_id = str(record.get('template-id') or record.get('templateID') or '')
+    name = info.get('name') or template_id or record.get('template') or 'finding'
+    severity = _sev(info.get('severity') or record.get('severity'))
+    matched = str(record.get('matched-at') or record.get('matched_at') or
+                  record.get('matched') or record.get('host') or '')
+    response = str(record.get('response') or '')
+    response_headers = response.split('\r\n\r\n', 1)[0].split('\n\n', 1)[0]
+    evidence = '\n'.join(v for v in (matched, response_headers[:1200]) if v)
+    confidence = _confidence_for_tool(tool_key, otype, is_json_confirmed=True)
+    ftype = 'vuln'
+
+    # A redirect is proven by the response itself, not merely by the template name.
+    if 'open-redirect' in template_id.lower():
+        status = re.search(r'^HTTP/\S+\s+(3\d\d)\b', response_headers, re.M | re.I)
+        location = re.search(r'^Location:\s*(\S+)', response_headers, re.M | re.I)
+        if status and location:
+            confidence, ftype = 'confirmed', 'open_redirect'
+            name = 'Open redirect confirmado por resposta HTTP 3xx'
+            evidence = f'{matched}\nHTTP {status.group(1)}\nLocation: {location.group(1)}'
+
+    # phpinfo templates contain strong response markers and can be confirmed safely.
+    if 'phpinfo' in template_id.lower() and re.search(r'PHP Version|phpinfo\(\)|PHP Credits', response, re.I):
+        confidence, ftype = 'confirmed', 'info'
+        name = 'PHPInfo exposto publicamente'
+
+    # This template is behavior-only and can match unrelated applications that
+    # reflect the same payload. Do not claim a product-specific CVE without its
+    # product fingerprint in the response.
+    if template_id.upper() == 'CVE-2022-3766' and not re.search(r'phpMyFAQ', response, re.I):
+        confidence, ftype = 'possible', 'xss'
+        name = 'Reflexão de payload XSS; atribuição a phpMyFAQ não comprovada'
+        evidence = (evidence + '\nFingerprint phpMyFAQ ausente; validar como XSS genérico no navegador').strip()
+
+    return _finding(tool_key, ftype, str(name), severity, matched, evidence, confidence)
+
+
+def parse_output(tool_key, raw, default_target=''):
     """Retorna (assets, findings). assets = pivos host/url/path para o pipeline."""
     tool = TOOLS.get(tool_key, {})
     otype = tool.get('output', 'raw')
@@ -2222,12 +2337,10 @@ def parse_output(tool_key, raw):
                 url = req.get('endpoint') or o.get('endpoint') or o.get('url') or ''
                 if url: assets.append({'value': url, 'label': url[:80], 'type': 'url'})
             elif otype in ('cves','misconfig','tech_vuln','xss','sqli'):
-                info = o.get('info') or {}
-                name = info.get('name') or o.get('template-id') or o.get('templateID') or o.get('template') or 'finding'
-                sev = _sev(info.get('severity') or o.get('severity'))
-                matched = o.get('matched-at') or o.get('matched_at') or o.get('matched') or o.get('host') or ''
-                conf = _confidence_for_tool(tool_key, otype, is_json_confirmed=True)
-                findings.append(_finding(tool_key, 'vuln', str(name), sev, to_host(matched) or matched, matched, conf))
+                findings.append(_nuclei_json_finding(tool_key, otype, o))
+        for finding in findings:
+            if not finding.get('target'):
+                finding['target'] = default_target
         return _dedup_assets(assets), findings
 
     if otype == 'subdomains':
@@ -2253,16 +2366,19 @@ def parse_output(tool_key, raw):
 
     # wafw00f: parser dedicado — 1 finding por WAF, sem ruído de ANSI
     if otype == 'waf':
-        findings += _parse_wafw00f(tool_key, raw, assets[0]['value'] if assets else '')
+        findings += _parse_wafw00f(tool_key, raw, default_target)
     elif otype == 'headers':
-        findings += _parse_headers(tool_key, raw, assets[0]['value'] if assets else '')
+        findings += _parse_headers(tool_key, raw, default_target)
     elif otype == 'xss' and tool_key in ('dalfox', 'dalfox_url'):
         findings += _parse_dalfox(tool_key, lines)
     elif otype == 'nikto':
         clean = [l for l in lines if not _NIKTO_NOISE_RE.search(l.strip())]
-        findings += _text_findings(tool_key, otype, clean)
+        findings += _text_findings(tool_key, otype, clean, default_target)
     else:
-        findings += _text_findings(tool_key, otype, lines)
+        findings += _text_findings(tool_key, otype, lines, default_target)
+    for finding in findings:
+        if not finding.get('target'):
+            finding['target'] = default_target
     return _dedup_assets(assets), findings
 
 def persist_and_emit_findings(scan_id, assets, findings, sid):
@@ -2475,7 +2591,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         # A failed invocation often prints usage/help/error text that resembles
         # findings. Only successful scanner output is eligible for parsing.
         if successful:
-            assets, findings = parse_output(tool_key, raw)
+            assets, findings = parse_output(tool_key, raw, effective_target)
             if tool_key in ('dalfox', 'dalfox_url'):
                 findings = validate_dalfox_findings(findings)
         else:
@@ -2519,7 +2635,7 @@ def run_adaptive_web(scan_id, targets, sid):
     initial = to_url(scan.get('target', '')) or to_http_url(scan.get('target', ''))
     report = {'pages': [], 'forms': [], 'tasks': [], 'pending': [], 'errors': [],
               'limits': {'pages': 12, 'depth': 2, 'jobs': 12}, 'truncated': False,
-              'limitations': ['HTML estático: formulários gerados por JavaScript não são analisados',
+              'limitations': ['JavaScript não é executado; somente fetch literal e URLSearchParams simples são extraídos',
                               'Login por listas exige configuração e critério de sucesso; uploads e fluxos destrutivos exigem revisão',
                               'completed indica processo concluído, não ausência de vulnerabilidades']}
     for key, variable, ceiling in (('pages', 'RECONX_ADAPTIVE_PAGES', 200),
@@ -2631,8 +2747,9 @@ def run_adaptive_web(scan_id, targets, sid):
                     pending['reason'] = 'Bypass lógico exige revisão; resultado das tentativas por lista está em login_testing'
         report['pages'] = [p.url for p in pages]
         report['forms'] = [{'page': f['page'], 'action': f['action'], 'method': f['method'],
-                            'login': f['login'], 'fields': [v['name'] for v in f['fields']]}
-                           for p in pages for f in p.forms]
+                            'login': f['login'], 'source': f.get('source', 'html'),
+                            'fields': [v['name'] for v in f['fields']]}
+                           for p in pages for f in [*p.forms, *p.script_requests]]
         log(f"[Adaptive] {len(pages)} páginas, {len(report['forms'])} formulários; {len(jobs)} testes selecionados")
         if report['truncated']:
             log('[Adaptive] Há URLs na fila não analisadas: limite de páginas ou cancelamento atingido')
@@ -2652,7 +2769,8 @@ def run_adaptive_web(scan_id, targets, sid):
                     if response['status'] != 200:
                         raise RuntimeError('Página do formulário não acessível ao atualizar tokens')
                     fresh = parse_page(job['form']['page'], response['body'])
-                    match = next((f for f in fresh.forms if f['action'] == job['form']['action']
+                    match = next((f for f in [*fresh.forms, *fresh.script_requests]
+                                  if f['action'] == job['form']['action']
                                   and f['method'] == job['form']['method']
                                   and [x['name'] for x in f['fields']] == [x['name'] for x in job['form']['fields']]), None)
                     if not match:
@@ -2692,6 +2810,21 @@ def targets_for_tool(tool_key, target_list):
     explicit_urls = [to_url(value) for value in target_list if to_url(value)]
     if input_type == 'url':
         values = explicit_urls or [to_http_url(value) for value in target_list]
+        tool = TOOLS.get(tool_key, {})
+        if tool.get('phase') == 'test':
+            # Static assets are evidence/input for manual review, not suitable
+            # roots for active web scanners.
+            values = [value for value in values if not re.search(
+                r'\.(?:css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|mp4|pdf|zip)(?:$|\?)',
+                urlsplit(value).path, re.I)]
+        if values and tool_key in {'nikto', 'sqlmap', 'corsy', 'nuclei_takeover'}:
+            values = values[:1]
+        elif tool_key in {'commix', 'nuclei_dast'}:
+            values = [value for value in values if urlsplit(value).query]
+        elif tool_key == 'dalfox':
+            # Let Dalfox mine the application root once, then only revisit
+            # explicitly parameterized URLs.
+            values = values[:1] + [value for value in values[1:] if urlsplit(value).query]
     elif input_type == 'host':
         values = [to_host(value) for value in target_list]
     elif input_type == 'domain':

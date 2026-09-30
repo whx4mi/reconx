@@ -32,12 +32,16 @@ class PageParser(HTMLParser):
         self.select = None
         self.option = None
         self.public_text = ''
+        self.scripts, self.current_script = [], None
+        self.script_requests = []
         self.ignore_text = 0
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag in ('script', 'style', 'textarea'):
             self.ignore_text += 1
+        if tag == 'script' and not a.get('src'):
+            self.current_script = ''
         if tag == 'a' and a.get('href'):
             self.links.append(urljoin(self.url, a['href']))
         if tag == 'form':
@@ -75,6 +79,8 @@ class PageParser(HTMLParser):
             self.option = {'value': a.get('value'), 'text': '', 'selected': 'selected' in a}
 
     def handle_data(self, data):
+        if self.current_script is not None:
+            self.current_script += data
         if not self.ignore_text and len(self.public_text) < 2000:
             self.public_text += ' ' + ' '.join(data.split())[:2000 - len(self.public_text)]
         if self.textarea is not None:
@@ -96,11 +102,51 @@ class PageParser(HTMLParser):
             self.select = self.option = None
         if tag == 'form':
             self.current = self.textarea = self.select = self.option = None
+        if tag == 'script' and self.current_script is not None:
+            self.scripts.append(self.current_script)
+            self.current_script = None
+
+
+def _script_request_forms(url, scripts):
+    """Extract simple same-page fetch/XHR request surfaces from inline JS.
+
+    This intentionally handles only literal URLs and URLSearchParams append
+    calls. It does not execute JavaScript and never follows an external URL.
+    """
+    forms = []
+    for script in scripts:
+        parameter_sets = {}
+        for match in re.finditer(
+                r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+URLSearchParams\s*\([^)]*\)',
+                script):
+            variable = match.group(1)
+            names = re.findall(
+                rf'\b{re.escape(variable)}\.append\s*\(\s*[\'\"]([^\'\"]+)[\'\"]\s*,', script)
+            if names:
+                parameter_sets[variable] = list(dict.fromkeys(names))
+        for match in re.finditer(
+                r'fetch\s*\(\s*([\'\"])([^\'\"]+)\1\s*,\s*\{(.*?)\}\s*\)',
+                script, re.I | re.S):
+            endpoint, options = match.group(2), match.group(3)
+            method_match = re.search(r'\bmethod\s*:\s*[\'\"]([A-Za-z]+)[\'\"]', options, re.I)
+            method = method_match.group(1).upper() if method_match else 'GET'
+            body_match = re.search(r'\bbody\s*:\s*([A-Za-z_$][\w$]*)', options)
+            names = parameter_sets.get(body_match.group(1), []) if body_match else []
+            if method not in ('GET', 'POST') or not names:
+                continue
+            forms.append({
+                'page': url, 'action': urljoin(url, endpoint), 'method': method,
+                'enctype': 'application/x-www-form-urlencoded',
+                'fields': [{'name': name, 'type': 'text', 'value': ''} for name in names],
+                'login': False, 'upload': False, 'source': 'javascript',
+            })
+    return forms
 
 
 def parse_page(url, html):
     parser = PageParser(url)
     parser.feed(html)
+    parser.script_requests = _script_request_forms(url, parser.scripts)
     return parser
 
 
@@ -158,7 +204,7 @@ def plan_tests(initial_url, pages, max_jobs=12):
         if parse_qsl(urlsplit(page.url).query, keep_blank_values=True):
             for tool in ('sqlmap_url', 'dalfox_url'):
                 add(tool, page.url, 'Parâmetros na URL')
-        for form in page.forms:
+        for form in [*page.forms, *page.script_requests]:
             action = scoped_url(initial_url, form['action'])
             if not action:
                 pending.append({'url': form['page'], 'reason': 'Action do formulário fora do escopo'})
@@ -172,6 +218,10 @@ def plan_tests(initial_url, pages, max_jobs=12):
             fields = [f for f in form['fields'] if not TOKEN.search(f['name']) and f['type'] not in ('hidden', 'submit')]
             if not fields:
                 pending.append({'url': action, 'reason': 'Sem campos editáveis para injection'})
+                continue
+            if form.get('source') == 'javascript':
+                add('sqlmap_url', action, 'JavaScript/fetch: testar SQLi no corpo POST', form)
+                add('commix', action, 'JavaScript/fetch: testar command injection no corpo POST', form)
                 continue
             # Login detection is evidence of an auth surface, never proof of bypass.
             add('sqlmap_url', action, 'Login: testar injection nos campos de autenticação' if form['login'] else 'Formulário: testar SQLi', form)

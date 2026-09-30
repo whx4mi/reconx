@@ -2,6 +2,7 @@ import sqlite3
 import os
 import tempfile
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
 
 _RESULTS = tempfile.TemporaryDirectory()
@@ -60,6 +61,112 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertIn('http://lab.test/app/', cmd)
         ffuf, _ = reconx.build_cmd('ffuf_dirs', 'http://lab.test/app/')
         self.assertIn('http://lab.test/app/FUZZ', ffuf)
+
+    def test_active_scanners_receive_only_compatible_web_targets(self):
+        targets = [
+            'http://lab.test/app/',
+            'http://lab.test/app/ping.php',
+            'http://lab.test/app/main.js',
+            'http://lab.test/app/redirect.php?r=https://example.test',
+        ]
+        self.assertEqual(reconx.targets_for_tool('nikto', targets), [targets[0]])
+        self.assertEqual(reconx.targets_for_tool('sqlmap', targets), [targets[0]])
+        self.assertEqual(reconx.targets_for_tool('commix', targets), [targets[3]])
+        self.assertEqual(reconx.targets_for_tool('nuclei_dast', targets), [targets[3]])
+        self.assertNotIn(targets[2], reconx.targets_for_tool('nuclei_cves', targets))
+
+    def test_commix_operational_critical_is_not_a_finding(self):
+        raw = "[critical] No parameter(s) found for testing in the provided data"
+        _, findings = reconx.parse_output('commix', raw, 'http://lab.test/app/')
+        self.assertEqual(findings, [])
+
+    def test_injection_parsers_require_explicit_positive_evidence(self):
+        sqlmap_noise = '''sqlmap identified the target form\n[INFO] testing SQL injection
+[CRITICAL] there were no forms found at the given target URL'''
+        commix_noise = '''Automated All-in-One OS Command Injection Exploitation Tool
+[info] Performing heuristic (passive) tests on the target URL.'''
+        self.assertEqual(reconx.parse_output('sqlmap', sqlmap_noise, 'http://lab.test/')[1], [])
+        self.assertEqual(reconx.parse_output('commix', commix_noise, 'http://lab.test/')[1], [])
+
+        sqlmap_positive = "[INFO] GET parameter 'id' appears to be 'AND boolean-based blind' injectable"
+        commix_positive = "[info] The POST parameter 'd' appears to be injectable via classic injection"
+        self.assertEqual(len(reconx.parse_output('sqlmap_url', sqlmap_positive, 'http://lab.test/')[1]), 1)
+        self.assertEqual(len(reconx.parse_output('commix', commix_positive, 'http://lab.test/')[1]), 1)
+
+    def test_nikto_keeps_checks_but_not_metadata_or_false_positive_warning(self):
+        raw = '''+ Platform: Linux/Unix
++ Server: Apache/2.4.66 (Ubuntu)
++ [999967] /: Web Server returns a valid response with junk HTTP methods which may cause false positives.
++ [750510] /phpinfo.php: Output from the phpinfo() function was found.'''
+        _, findings = reconx.parse_output('nikto', raw, 'http://lab.test/')
+        self.assertEqual(len(findings), 1)
+        self.assertIn('phpinfo.php', findings[0]['name'])
+
+    def test_nuclei_redirect_and_phpinfo_use_response_evidence(self):
+        redirect = {
+            'template-id': 'open-redirect',
+            'info': {'name': 'Open Redirect Detection', 'severity': 'medium'},
+            'matched-at': 'http://lab.test/app/go.php?r=https://oast.me',
+            'response': 'HTTP/1.1 302 Found\r\nLocation: https://oast.me\r\n\r\n',
+        }
+        _, findings = reconx.parse_output('nuclei_dast', __import__('json').dumps(redirect))
+        self.assertEqual(findings[0]['confidence'], 'confirmed')
+        self.assertEqual(findings[0]['ftype'], 'open_redirect')
+        self.assertTrue(findings[0]['target'].startswith('http://lab.test/app/'))
+
+        phpinfo = {
+            'template-id': 'phpinfo-files',
+            'info': {'name': 'PHPinfo Page - Detect', 'severity': 'low'},
+            'matched-at': 'http://lab.test/app/phpinfo.php',
+            'response': 'HTTP/1.1 200 OK\r\n\r\n<h1>PHP Version 8.4</h1>',
+        }
+        _, findings = reconx.parse_output('nuclei_misconfig', __import__('json').dumps(phpinfo))
+        self.assertEqual(findings[0]['confidence'], 'confirmed')
+        self.assertEqual(findings[0]['name'], 'PHPInfo exposto publicamente')
+
+    def test_product_specific_cve_without_fingerprint_stays_generic_candidate(self):
+        record = {
+            'template-id': 'CVE-2022-3766',
+            'info': {'name': 'phpMyFAQ Cross-Site Scripting', 'severity': 'medium'},
+            'matched-at': 'http://lab.test/app/?q=%3Csvg%20onload=alert(1)%3E',
+            'response': 'HTTP/1.1 200 OK\r\n\r\n<div><svg onload=alert(1)></div>',
+        }
+        _, findings = reconx.parse_output('nuclei_dast', __import__('json').dumps(record))
+        self.assertEqual(findings[0]['confidence'], 'possible')
+        self.assertEqual(findings[0]['ftype'], 'xss')
+        self.assertNotIn('phpMyFAQ Cross-Site Scripting', findings[0]['name'])
+        self.assertIn('Fingerprint phpMyFAQ ausente', findings[0]['evidence'])
+
+    def test_duplicate_xss_is_upgraded_instead_of_counted_twice(self):
+        scan_id = f'dedup-{uuid.uuid4().hex}'
+        reconx.db_create_scan(scan_id, 'http://lab.test/app/', 'full_pentest', '')
+        first = reconx.db_add_finding(
+            scan_id, 'nuclei_dast', 'xss', 'XSS candidate', 'medium',
+            'http://lab.test/app/index.php?search=%3Csvg%20onload%3Dalert(1)%3E',
+            'reflection', 'possible')
+        upgraded = reconx.db_add_finding(
+            scan_id, 'dalfox_url', 'xss', 'XSS confirmado no Chromium', 'high',
+            'http://lab.test/app/?search=%3Csvg%20onload%3Dalert(1)%3E',
+            'browser marker', 'confirmed')
+        findings = reconx.db_findings(scan_id)
+        self.assertTrue(first[0])
+        self.assertTrue(upgraded[0])
+        self.assertEqual(first[1], upgraded[1])
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]['confidence'], 'confirmed')
+        self.assertEqual(findings[0]['tool'], 'dalfox_url')
+
+    def test_xss_manual_verifier_requires_browser_execution(self):
+        finding = {'name': 'XSS candidate', 'ftype': 'xss', 'tool': 'dalfox',
+                   'target': 'http://lab.test/?q=x', 'evidence': '', 'confidence': 'likely'}
+        output = '[POC][V][GET][inHTML] http://lab.test/?q=%3Csvg%20onload=alert(1)%3E'
+        completed = MagicMock(stdout=output, stderr='', returncode=1)
+        with patch.object(reconx.shutil, 'which', return_value='/usr/bin/dalfox'), \
+                patch.object(reconx.subprocess, 'run', return_value=completed), \
+                patch.object(reconx, 'browser_validate_xss', return_value=None):
+            result = reconx.run_verification(finding)
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['confidence'], 'likely')
 
     def test_full_pentest_includes_parameter_aware_dast(self):
         tools = next(stage['tools'] for stage in reconx.PIPELINES['full_pentest']['stages']

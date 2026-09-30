@@ -73,6 +73,21 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertTrue(any(j['url'] == page.url for j in jobs))
         self.assertEqual(pending, [])
 
+    def test_inline_fetch_urlsearchparams_becomes_post_injection_surface(self):
+        page = parse_page(BASE, '''<script>
+            const data = new URLSearchParams();
+            data.append('d', 'example.test');
+            fetch('ping.php', {method: 'POST', body: data});
+        </script>''')
+        self.assertEqual(len(page.script_requests), 1)
+        request = page.script_requests[0]
+        self.assertEqual(request['action'], BASE + 'ping.php')
+        self.assertEqual(request['method'], 'POST')
+        self.assertEqual([field['name'] for field in request['fields']], ['d'])
+        jobs, pending = plan_tests(BASE, [page])
+        self.assertEqual([job['tool'] for job in jobs], ['sqlmap_url', 'commix'])
+        self.assertEqual(pending, [])
+
     def test_crawler_follows_local_links_and_preserves_queries(self):
         fetched = []
         def fetch(url):
@@ -112,6 +127,15 @@ class WebIntelligenceTests(unittest.TestCase):
                             ('--csrf-token', 'csrf'), ('--csrf-url', BASE), ('-p', 'username')):
             self.assertEqual(cmd[cmd.index(flag) + 1], value)
         self.assertIn('--ignore-redirects', cmd)
+
+    def test_commix_receives_post_body_cookie_and_parameter(self):
+        ns = load_helpers()
+        context = {'data': 'd=example.test', 'cookie': 'PHPSESSID=session',
+                   'parameters': ['d'], 'tokens': [], 'page': BASE}
+        cmd, _ = ns['build_cmd']('commix', BASE + 'ping.php', request_context=context)
+        self.assertIn('--data=d=example.test', cmd)
+        self.assertIn('--cookie=PHPSESSID=session', cmd)
+        self.assertEqual(cmd[cmd.index('-p') + 1], 'd')
 
     def test_tools_keep_path_and_query(self):
         ns = load_helpers()
@@ -163,7 +187,8 @@ class WebIntelligenceTests(unittest.TestCase):
 
     def test_positive_finding_after_120_operational_lines_is_retained(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))
-        names = {'_TOOL_NOISE', '_NOISE_RE', '_HI_RE', '_MED_RE', '_LOW_RE'}
+        names = {'_TOOL_NOISE', '_NOISE_RE', '_HI_RE', '_MED_RE', '_LOW_RE',
+                 '_SQLI_POSITIVE_RE', '_CMDI_POSITIVE_RE'}
         nodes = [n for n in tree.body if (isinstance(n, ast.Assign) and
                  any(isinstance(t, ast.Name) and t.id in names for t in n.targets)) or
                  (isinstance(n, ast.FunctionDef) and n.name == '_text_findings')]

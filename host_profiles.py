@@ -192,8 +192,11 @@ class Store:
                     continue
                 if not 1 <= port <= 65535 or protocol not in ('tcp', 'udp'):
                     continue
-                con.execute('''INSERT OR REPLACE INTO host_services
-                    (host_id,port,protocol,service,scan_id) VALUES(?,?,?,?,?)''',
+                con.execute('''INSERT INTO host_services
+                    (host_id,port,protocol,service,scan_id) VALUES(?,?,?,?,?)
+                    ON CONFLICT(host_id,port,protocol,scan_id) DO UPDATE SET
+                    service=CASE WHEN excluded.service<>'' THEN excluded.service
+                                 ELSE host_services.service END''',
                     (host_id, port, protocol, str(service or '')[:80], scan_id))
 
     def list_hosts(self, scanned_only=False):
@@ -226,7 +229,9 @@ class Store:
             for check in checks:
                 check['label'] = CHECKS.get(check['check_key'], check['check_key'])
             assets = [dict(row) for row in con.execute('''SELECT atype,value FROM host_assets
-                WHERE host_id=? ORDER BY atype,value LIMIT 200''', (host_id,))]
+                WHERE host_id=? ORDER BY atype,value LIMIT 200''', (host_id,))
+                if not (row['atype'] == 'url' and re.search(
+                    r'/(?:var/www|etc|usr/share|home|opt)/', row['value'], re.I))]
             services = [dict(row) for row in con.execute('''SELECT port,protocol,service,scan_id
                 FROM host_services WHERE host_id=? ORDER BY port LIMIT 200''', (host_id,))]
             # Só atribui findings com um host explícito; scans podem pivotar para outros alvos.
