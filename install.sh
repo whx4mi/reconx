@@ -278,7 +278,7 @@ fi
 
 # ── Ferramentas Go ─────────────────────────────────────────────────
 info "Verificando ferramentas Go..."
-export PATH=$PATH:/root/go/bin:/usr/local/go/bin
+export PATH=/root/go/bin:/usr/local/go/bin:$PATH
 export GOPATH=/root/go
 
 # v5: + gowitness (caso não tenha vindo via apt)
@@ -298,10 +298,21 @@ GO_TOOLS=(
     "gowitness:github.com/sensepost/gowitness@latest"
 )
 
+is_projectdiscovery_httpx() {
+    local candidate
+    candidate="$(command -v httpx 2>/dev/null || true)"
+    [[ -n "$candidate" ]] || return 1
+    "$candidate" -version 2>&1 | grep -Eqi 'Current Version|projectdiscovery'
+}
+
 MISSING_GO=()
 for entry in "${GO_TOOLS[@]}"; do
     bin="${entry%%:*}"
-    command -v "$bin" &>/dev/null || MISSING_GO+=("$entry")
+    if [[ "$bin" == "httpx" ]]; then
+        is_projectdiscovery_httpx || MISSING_GO+=("$entry")
+    else
+        command -v "$bin" &>/dev/null || MISSING_GO+=("$entry")
+    fi
 done
 
 if [[ ${#MISSING_GO[@]} -gt 0 ]]; then
@@ -448,7 +459,10 @@ echo -e "  ${CYAN}Verificando binários disponíveis:${NC}"
 ALL_BINS=(nmap curl nikto sqlmap nuclei httpx subfinder ffuf dalfox commix corsy jwt_tool redis-cli mongosh)
 MISSING_BINS=()
 for b in "${ALL_BINS[@]}"; do
-    if command -v "$b" &>/dev/null; then
+    if [[ "$b" == "httpx" ]] && ! is_projectdiscovery_httpx; then
+        echo -e "    ${RED}✗${NC} httpx  (o binário encontrado é o cliente Python; falta ProjectDiscovery HTTPx)"
+        MISSING_BINS+=("$b")
+    elif command -v "$b" &>/dev/null; then
         echo -e "    ${GREEN}✓${NC} $b"
     else
         echo -e "    ${RED}✗${NC} $b  (ausente)"

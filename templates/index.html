@@ -775,9 +775,9 @@ socket.on('tool_output', d => {
 
 socket.on('tool_done', d => {
   S.done++;
-  updateStep(S.done - 1, d.exit_code === 0 ? 'done' : 'warn');
+  const ok = d.success === true || (d.success === undefined && d.exit_code === 0);
+  updateStep(S.done - 1, ok ? 'done' : 'warn');
   setProgress((S.done / Math.max(S.total, 1)) * 80);
-  const ok = d.exit_code === 0;
   const b = document.createElement('div');
   b.innerHTML = `    <span class="badge ${ok?'b-ok':'b-warn'}">${ok?'✓':'!'} ${d.elapsed}s · ${d.lines} linhas</span>`;
   document.getElementById('tbody').appendChild(b);
@@ -887,6 +887,12 @@ socket.on('pipeline_complete', d => {
   renderFollowups();
   loadResults();
   markAllDone();
+});
+
+socket.on('pipeline_error', d => {
+  if (d.scan_id !== S.scanId && d.scan_id !== S.lastScanId) return;
+  tlog('lr', `[!] ${d.message || 'Falha interna no pipeline'}`);
+  toast('Pipeline interrompido; consulte o terminal', 'warn');
 });
 
 socket.on('scan_cancelled', () => {

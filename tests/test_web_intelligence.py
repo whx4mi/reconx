@@ -149,6 +149,17 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertIsNone(noise.search("[INFO] POST parameter 'username' is vulnerable"))
         self.assertIsNotNone(noise.search('[INFO] testing connection to target'))
         self.assertIsNotNone(noise.search('[INFO] parameter is not injectable'))
+        self.assertIsNotNone(noise.search("[WARNING] heuristic test shows parameter 'q' might not be injectable"))
+        self.assertIsNotNone(noise.search("[WARNING] parameter 'q' does not seem to be injectable"))
+
+    def test_dalfox_v3_uses_plural_cookies_option(self):
+        ns = load_helpers()
+        context = {'data': None, 'cookie': 'PHPSESSID=session',
+                   'parameters': ['q'], 'tokens': [], 'page': BASE}
+        cmd, _ = ns['build_cmd']('dalfox_url', BASE + '?q=x', request_context=context)
+        self.assertEqual(cmd[cmd.index('--url') + 1], BASE + '?q=x')
+        self.assertIn('--cookies', cmd)
+        self.assertNotIn('--cookie', cmd)
 
     def test_positive_finding_after_120_operational_lines_is_retained(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))

@@ -18,11 +18,11 @@ Novidades v5:
 """
 from flask import Flask, render_template, request, jsonify, Response
 from flask_socketio import SocketIO, emit
-import subprocess, threading, os, json, uuid, shutil, time, re, socket, secrets, argparse, sqlite3, hashlib
+import subprocess, threading, os, json, uuid, shutil, time, re, socket, secrets, argparse, sqlite3, hashlib, ipaddress
 from datetime import datetime
 from pathlib import Path
 import random
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import tempfile
 import http.cookiejar
 import urllib.request
@@ -591,7 +591,7 @@ TOOLS = {
         "cmd": ["httpx", "-u", "{http_url}", "-silent", "-title", "-tech-detect",
                 "-status-code", "-content-length", "-json",
                 "-follow-host-redirects", "-ports", "80,443,8080,8443,8888,8000,3000,3001,5000"],
-        "input": "host", "output": "live_hosts",
+        "input": "url", "output": "live_hosts",
         "json": True, "binary": "httpx", "tags": ["active","web","fast"],
         "proxy_support": True,
         "manual_followup": [
@@ -603,7 +603,7 @@ TOOLS = {
         "label": "WhatWeb", "phase": "recon", "category": "web",
         "desc": "Fingerprint de CMS e tecnologias",
         "cmd": ["whatweb", "--color=never", "--no-errors", "{http_url}"],
-        "input": "host", "output": "fingerprint",
+        "input": "url", "output": "fingerprint",
         "binary": "whatweb", "tags": ["active","fingerprint"],
         "proxy_support": True,
         "manual_followup": [
@@ -615,7 +615,7 @@ TOOLS = {
         "label": "WAFw00f", "phase": "recon", "category": "web",
         "desc": "Detecta tipo de WAF presente",
         "cmd": ["wafw00f", "{http_url}"],
-        "input": "host", "output": "waf",
+        "input": "url", "output": "waf",
         "binary": "wafw00f", "tags": ["active","waf"],
         "proxy_support": True,
         "manual_followup": [
@@ -627,7 +627,7 @@ TOOLS = {
         "label": "cURL Headers", "phase": "recon", "category": "web",
         "desc": "Inspeciona headers HTTP de resposta",
         "cmd": ["curl", "-sI", "--max-time", "15", "-L", "{http_url}"],
-        "input": "host", "output": "headers",
+        "input": "url", "output": "headers",
         "binary": "curl", "tags": ["passive","fast"],
         "proxy_support": True,
         "manual_followup": [
@@ -641,7 +641,7 @@ TOOLS = {
         "desc": "Screenshot do alvo (Chrome headless) p/ triagem visual",
         "cmd": ["gowitness", "scan", "single", "--url", "{http_url}",
                 "--screenshot-path", str(SCREENS_DIR), "--write-jsonl", "--quiet"],
-        "input": "host", "output": "raw",
+        "input": "url", "output": "raw",
         "binary": "gowitness", "tags": ["active","screenshot"],
         "proxy_support": True, "timeout": 120,
         "manual_followup": [
@@ -654,12 +654,12 @@ TOOLS = {
     "ffuf_dirs": {
         "label": "FFUF Dirs", "phase": "recon", "category": "fuzzing",
         "desc": "Fuzzing de diretórios com recursão automática (depth 2)",
-        "cmd": ["ffuf", "-u", "{http_url}/FUZZ",
+        "cmd": ["ffuf", "-u", "{base_url}FUZZ",
                 "-w", WL_SMALL or WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
                 "-mc", "200,201,204,301,302,307,401,403,405",
                 "-t", "40", "-ac", "-s",
                 "-recursion", "-recursion-depth", "2"],
-        "input": "host", "output": "dirs",
+        "input": "url", "output": "dirs",
         "binary": "ffuf", "tags": ["active","fuzzing"],
         "proxy_support": True,
         "manual_followup": [
@@ -671,12 +671,12 @@ TOOLS = {
     "ffuf_ext": {
         "label": "FFUF Extensions", "phase": "recon", "category": "fuzzing",
         "desc": "Fuzzing com extensões .php .html .bak .txt",
-        "cmd": ["ffuf", "-u", "{http_url}/FUZZ",
+        "cmd": ["ffuf", "-u", "{base_url}FUZZ",
                 "-w", WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
                 "-e", ".php,.html,.txt,.bak,.old,.zip,.conf,.env,.log",
                 "-mc", "200,201,301,302,401,403",
                 "-t", "40", "-ac", "-s"],
-        "input": "host", "output": "dirs",
+        "input": "url", "output": "dirs",
         "binary": "ffuf", "tags": ["active","fuzzing"],
         "proxy_support": True,
         "manual_followup": [
@@ -692,7 +692,7 @@ TOOLS = {
                 "-u", "{http_url}",
                 "-w", WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
                 "-q", "--no-error", "--no-progress", "-b", "404,400,503"],
-        "input": "host", "output": "dirs",
+        "input": "url", "output": "dirs",
         "binary": "gobuster", "tags": ["active","fuzzing"],
         "proxy_support": True,
         "manual_followup": [],
@@ -704,7 +704,7 @@ TOOLS = {
                 "-u", "{http_url}",
                 "-w", WL_DNS or WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
                 "-q", "--no-error", "--no-progress", "--append-domain"],
-        "input": "host", "output": "raw",
+        "input": "url", "output": "raw",
         "binary": "gobuster", "tags": ["active","fuzzing","vhost"],
         "proxy_support": True,
         "manual_followup": [
@@ -782,7 +782,7 @@ TOOLS = {
         "label": "Nikto", "phase": "test", "category": "web_vuln",
         "desc": "Scanner de vulnerabilidades web clássico",
         "cmd": ["nikto", "-h", "{http_url}", "-nointeractive", "-Display", "P"],
-        "input": "host", "output": "nikto",
+        "input": "url", "output": "nikto",
         "binary": "nikto", "tags": ["active","vuln"],
         "proxy_support": True,
         "manual_followup": [
@@ -795,7 +795,7 @@ TOOLS = {
         "desc": "CVEs críticos, altos e médios via templates",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "cve",
                 "-severity", "critical,high,medium", "-jsonl", "-silent"],
-        "input": "host", "output": "cves",
+        "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["active","cve"],
         "proxy_support": True,
         "manual_followup": [
@@ -808,7 +808,7 @@ TOOLS = {
         "desc": "Misconfigurations, exposições e default logins",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "misconfig,exposure,default-login",
                 "-jsonl", "-silent"],
-        "input": "host", "output": "misconfig",
+        "input": "url", "output": "misconfig",
         "json": True, "binary": "nuclei", "tags": ["active","misconfig"],
         "proxy_support": True,
         "manual_followup": [
@@ -821,7 +821,7 @@ TOOLS = {
         "desc": "Templates por tecnologia detectada",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "tech",
                 "-jsonl", "-silent"],
-        "input": "host", "output": "tech_vuln",
+        "input": "url", "output": "tech_vuln",
         "json": True, "binary": "nuclei", "tags": ["active","tech"],
         "proxy_support": True,
         "manual_followup": [],
@@ -831,7 +831,7 @@ TOOLS = {
         "desc": "Detecção de subdomain takeover (CNAMEs órfãos)",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "takeover",
                 "-jsonl", "-silent"],
-        "input": "host", "output": "misconfig",
+        "input": "url", "output": "misconfig",
         "json": True, "binary": "nuclei", "tags": ["active","takeover"],
         "proxy_support": True,
         "manual_followup": [
@@ -899,7 +899,7 @@ TOOLS = {
     "dalfox": {
         "label": "Dalfox (host)", "phase": "test", "category": "xss",
         "desc": "Scanner XSS no host — detecta e gera PoC",
-        "cmd": ["dalfox", "url", "{url}", "--no-color", "--silence",
+        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence",
                 "--follow-redirects"],
         "input": "url", "output": "xss",
         "binary": "dalfox", "tags": ["active","xss"],
@@ -915,7 +915,7 @@ TOOLS = {
     "dalfox_url": {
         "label": "Dalfox (URL params)", "phase": "test", "category": "xss",
         "desc": "XSS em parâmetros GET específicos",
-        "cmd": ["dalfox", "url", "{url}", "--no-color", "--silence"],
+        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence"],
         "input": "url", "output": "xss",
         "binary": "dalfox", "tags": ["active","xss"],
         "proxy_support": True,
@@ -928,7 +928,7 @@ TOOLS = {
         "desc": "Vulnerabilidades WordPress completo",
         "cmd": ["wpscan", "--url", "{http_url}", "--no-banner",
                 "--disable-tls-checks", "--enumerate", "p,t,u,vp"],
-        "input": "host", "output": "wordpress",
+        "input": "url", "output": "wordpress",
         "binary": "wpscan", "tags": ["active","wordpress"],
         "proxy_support": True,
         "manual_followup": [
@@ -943,7 +943,7 @@ TOOLS = {
         "desc": "Fuzzing recursivo de diretórios e arquivos",
         "cmd": ["feroxbuster", "-u", "{http_url}", "-q", "--no-state",
                 "-x", "php,html,js,txt,bak", "--auto-tune"],
-        "input": "host", "output": "dirs",
+        "input": "url", "output": "dirs",
         "binary": "feroxbuster", "tags": ["active","fuzzing","recursive"],
         "proxy_support": True,
         "manual_followup": [],
@@ -1057,7 +1057,7 @@ TOOLS = {
         "desc": "Detecta API keys, tokens e credenciais expostas em respostas HTTP e JS",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "exposure,token,secret,api",
                 "-severity", "critical,high,medium", "-jsonl", "-silent"],
-        "input": "host", "output": "cves",
+        "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["passive","secrets"],
         "proxy_support": True,
         "manual_followup": [
@@ -1106,7 +1106,7 @@ TOOLS = {
         "label": "nomore403 (bypass)", "phase": "test", "category": "web_vuln",
         "desc": "Testa 20+ técnicas de bypass em recursos 403 Forbidden",
         "cmd": ["nomore403", "-u", "{http_url}"],
-        "input": "host", "output": "raw",
+        "input": "url", "output": "raw",
         "binary": "nomore403", "tags": ["active","bypass"],
         "proxy_support": True,
         "manual_followup": [
@@ -1119,7 +1119,7 @@ TOOLS = {
         "label": "Corsy (CORS scan)", "phase": "test", "category": "web_vuln",
         "desc": "Detecta CORS misconfiguration — origin reflection, wildcard + credenciais",
         "cmd": ["corsy", "-u", "{http_url}", "-q"],
-        "input": "host", "output": "raw",
+        "input": "url", "output": "raw",
         "binary": "corsy", "tags": ["active","cors"],
         "proxy_support": True,
         "manual_followup": [
@@ -1385,7 +1385,7 @@ PIPELINES = {
              "tools":["ffuf_dirs","ffuf_ext","katana","arjun","waybackurls","gau"]},
             {"id":"s4","name":"Vulnerability Scan","phase":"test",
              "tools":["nikto","nuclei_cves","nuclei_misconfig","nuclei_tech",
-                      "nuclei_takeover","testssl","sqlmap","dalfox","commix","corsy"]},
+                      "nuclei_takeover","nuclei_dast","testssl","sqlmap","dalfox","commix","corsy"]},
         ]
     },
     "subdomain_recon": {
@@ -1470,8 +1470,38 @@ PIPELINES = {
 
 active_scans = {}
 
+def _projectdiscovery_httpx(path):
+    """Reject the unrelated Python HTTPX CLI that commonly owns /usr/bin/httpx."""
+    try:
+        probe = subprocess.run([path, '-version'], capture_output=True, text=True,
+                               timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = f'{probe.stdout}\n{probe.stderr}'
+    return bool(re.search(r'Current Version|projectdiscovery', output, re.I))
+
+
+def resolve_binary(binary):
+    candidates = []
+    found = shutil.which(binary)
+    if found:
+        candidates.append(found)
+    if binary == 'httpx':
+        candidates.extend(['/root/go/bin/httpx', str(Path.home() / 'go/bin/httpx')])
+        try:
+            candidates.extend(str(path) for path in Path('/home').glob('*/go/bin/httpx'))
+        except OSError:
+            pass
+    for candidate in dict.fromkeys(candidates):
+        if not candidate or not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        if binary != 'httpx' or _projectdiscovery_httpx(candidate):
+            return candidate
+    return None
+
+
 def check_binary(binary):
-    return bool(shutil.which(binary))
+    return bool(resolve_binary(binary))
 
 def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
     if tool_key == 'ai_ports':
@@ -1495,6 +1525,9 @@ def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
     else:
         t = raw_target.strip()
         r = {'{domain}':t, '{host}':t, '{http_url}':f'http://{t}', '{url}':t}
+
+    url_value = r.get('{http_url}', '')
+    r['{base_url}'] = url_value.rstrip('/') + '/'
 
     cmd = []
     for part in template:
@@ -1520,7 +1553,9 @@ def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
         if request_context.get('data') is not None:
             cmd += ['--data', request_context['data']]
         if request_context.get('cookie'):
-            cmd += ['--cookie', request_context['cookie']]
+            # Dalfox v3 uses --cookies; sqlmap uses the singular --cookie.
+            cmd += ['--cookies' if tool_key == 'dalfox_url' else '--cookie',
+                    request_context['cookie']]
         params = request_context.get('parameters', [])
         if params:
             if tool_key == 'dalfox_url':
@@ -1802,6 +1837,8 @@ _TOOL_NOISE = {
         r'\[INFO\](?!.*(?:injectable|vulnerable|injection point))|'
         r'\[WARNING\](?!.*(?:injectable|vulnerable))|'
         r'all tested parameters do not appear|not injectable|not vulnerable|'
+        r'(?:might|does).*not.*injectable|'
+        r'recommended to perform only basic UNION tests|do you want to reduce the number of requests|'
         r'\[CRITICAL\].*(?:timed out|connection|Unable)|'
         r'got a 3\d\d redirect|'
         r'you have not declared cookie|'
@@ -1914,7 +1951,7 @@ VERIFY_MAP = [
     {
         'id': 'xss', 'match': r'\bxss\b|cross.?site.?script',
         'tool': 'dalfox', 'needs': ['url'],
-        'cmd': ['dalfox', 'url', '{url}', '--no-color', '--silence', '--timeout', '20'],
+        'cmd': ['dalfox', 'url', '--url', '{url}', '--no-color', '--silence', '--timeout', '20'],
         'success': r'\[POC\]|\[V\]|triggered|reflected|\[VULN\]',
         'desc': 'Gera PoC de XSS com dalfox',
     },
@@ -2069,6 +2106,82 @@ def run_verification(finding):
     except Exception as e:
         return {'ok': False, 'tool': tool_bin, 'cmd': cmd, 'error': str(e)}
 
+def _parse_dalfox(tool_key, lines):
+    """Keep Dalfox verified candidates; browser execution decides confirmation."""
+    findings = []
+    for index, line in enumerate(lines):
+        if not re.search(r'\[POC\]\[V\]', line, re.I):
+            continue
+        match = re.search(r'https?://\S+', line)
+        target = match.group(0) if match else ''
+        evidence = '\n'.join(lines[index:index + 4])[:2000]
+        findings.append(_finding(
+            tool_key, 'xss', 'Candidato XSS indicado pelo Dalfox', 'high', target,
+            evidence, 'likely'))
+    return findings
+
+
+def browser_validate_xss(poc_url):
+    """Confirm reflected XSS by observing a harmless DOM marker in Chromium.
+
+    Dalfox can classify an injected string as a DOM object even when the
+    browser parses it as inert attributes. Try the reported element context
+    and an attribute-breakout variant; confirmation requires JavaScript to set
+    a marker on the body. Returns the working URL, or None.
+    """
+    if active_proxy.get('http') or active_proxy.get('socks'):
+        return None
+    browser = next((shutil.which(name) for name in
+                    ('chromium', 'chromium-browser', 'google-chrome')
+                    if shutil.which(name)), None)
+    if not browser:
+        return None
+    try:
+        parsed = urlsplit(poc_url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except (TypeError, ValueError):
+        return None
+    suspect = next((i for i, (_, value) in enumerate(pairs)
+                    if re.search(r'(?i)(?:<svg|onload|alert\s*\(|class=dlx) ', value + ' ')), None)
+    if suspect is None:
+        return None
+    marker_js = "document.body.setAttribute('data-reconx-xss','executed')"
+    payloads = (
+        f'\"><svg onload={marker_js}>',
+        f'\" autofocus onfocus={marker_js} x=\"',
+    )
+    for payload in payloads:
+        candidate = list(pairs)
+        candidate[suspect] = (candidate[suspect][0], payload)
+        url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                          urlencode(candidate, doseq=True), ''))
+        cmd = [browser, '--headless', '--no-sandbox', '--disable-gpu',
+               '--disable-dev-shm-usage', '--virtual-time-budget=5000',
+               '--dump-dom', url]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=20, check=False, env=proxy_env('curl', {}))
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if re.search(r'<body\b[^>]*\bdata-reconx-xss="executed"', result.stdout, re.I):
+            return url
+    return None
+
+
+def validate_dalfox_findings(findings):
+    for finding in findings:
+        if finding.get('ftype') != 'xss' or not finding.get('target'):
+            continue
+        working_url = browser_validate_xss(finding['target'])
+        if working_url:
+            finding.update(
+                name='XSS refletido confirmado no Chromium',
+                target=working_url,
+                confidence='confirmed',
+                evidence=(finding.get('evidence', '') +
+                          '\nChromium executou JavaScript e registrou data-reconx-xss=executed')[:2000])
+    return findings
+
 
 def parse_output(tool_key, raw):
     """Retorna (assets, findings). assets = pivos host/url/path para o pipeline."""
@@ -2143,6 +2256,8 @@ def parse_output(tool_key, raw):
         findings += _parse_wafw00f(tool_key, raw, assets[0]['value'] if assets else '')
     elif otype == 'headers':
         findings += _parse_headers(tool_key, raw, assets[0]['value'] if assets else '')
+    elif otype == 'xss' and tool_key in ('dalfox', 'dalfox_url'):
+        findings += _parse_dalfox(tool_key, lines)
     elif otype == 'nikto':
         clean = [l for l in lines if not _NIKTO_NOISE_RE.search(l.strip())]
         findings += _text_findings(tool_key, otype, clean)
@@ -2241,22 +2356,41 @@ def _record_host_attempt(scan_id, tool_key, raw_target, status, exit_code=None, 
     except (ValueError, sqlite3.Error):
         pass
 
+def tool_execution_succeeded(tool_key, returncode, raw, timed_out=False):
+    """Interpret scanner-specific exit contracts without accepting error text.
+
+    Dalfox v3 returns 1 when it reports a verified PoC and 2 for CLI errors.
+    Other catalog tools currently require a conventional zero exit status.
+    """
+    if timed_out:
+        return False
+    if returncode == 0:
+        return True
+    return (tool_key in ('dalfox', 'dalfox_url') and returncode == 1
+            and re.search(r'\[POC\]\[V\]', raw, re.I) is not None)
+
 def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None, outcome=None):
     if outcome is not None:
-        outcome.update(status='skipped', reason='Ferramenta indisponível ou alvo inválido')
+        outcome['status'] = 'skipped'
     tool = TOOLS.get(tool_key)
     if not tool:
         _record_host_attempt(scan_id, tool_key, raw_target, 'skipped')
+        if outcome is not None:
+            outcome['reason'] = 'Ferramenta não existe'
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':'Tool não existe'}, room=sid)
         return '', []
 
-    if not check_binary(tool['binary']):
+    binary_path = resolve_binary(tool['binary'])
+    if not binary_path:
         _record_host_attempt(scan_id, tool_key, raw_target, 'skipped')
+        incompatible = (tool['binary'] == 'httpx' and shutil.which('httpx'))
+        reason = ("'httpx' encontrado é o cliente Python, não o HTTPx da ProjectDiscovery"
+                  if incompatible else f"Binário '{tool['binary']}' não encontrado")
         if outcome is not None:
-            outcome['reason'] = f"Binário {tool['binary']} não instalado"
+            outcome['reason'] = reason
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
-            'reason':f"Binário '{tool['binary']}' não encontrado — apt install {tool['binary']} ou go install"}, room=sid)
+            'reason':reason}, room=sid)
         return '', []
 
     proxy = dict(active_proxy)
@@ -2268,6 +2402,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         socketio.emit('tool_skip', {'scan_id':scan_id,'tool':tool_key,
             'reason':effective_target}, room=sid)
         return '', []
+    cmd[0] = binary_path
 
     proxy_info = ""
     if proxy.get('http') or proxy.get('socks'):
@@ -2332,11 +2467,19 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         elapsed = round(time.time() - start, 1)
         raw = '\n'.join(output_lines)
         output_path = _save_tool_output(scan_id, tool_key, raw_target, raw)
-        run_status = 'completed' if proc.returncode == 0 and not timed_out['flag'] else 'failed'
+        successful = tool_execution_succeeded(tool_key, proc.returncode, raw, timed_out['flag'])
+        run_status = 'completed' if successful else 'failed'
         if outcome is not None:
             outcome.update(status=run_status,
                            exit_code=proc.returncode, timed_out=timed_out['flag'])
-        assets, findings = parse_output(tool_key, raw)
+        # A failed invocation often prints usage/help/error text that resembles
+        # findings. Only successful scanner output is eligible for parsing.
+        if successful:
+            assets, findings = parse_output(tool_key, raw)
+            if tool_key in ('dalfox', 'dalfox_url'):
+                findings = validate_dalfox_findings(findings)
+        else:
+            assets, findings = [], []
         persist_and_emit_findings(scan_id, assets, findings, sid)
         try:
             _record_host_attempt(scan_id, tool_key, raw_target, run_status, proc.returncode, output_path)
@@ -2355,6 +2498,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
             'scan_id': scan_id, 'tool': tool_key, 'label': tool['label'],
             'lines': len(output_lines), 'elapsed': elapsed,
             'exit_code': proc.returncode,
+            'success': successful,
             'timed_out': timed_out['flag'],
             'extracted_targets': extracted,
             'manual_followup': followup,
@@ -2537,6 +2681,42 @@ def run_adaptive_web(scan_id, targets, sid):
     results['analysis'] = {'raw': json.dumps(report, ensure_ascii=False), 'targets': []}
     return results, []
 
+def targets_for_tool(tool_key, target_list):
+    """Route each tool only to targets matching its declared input type.
+
+    A URL target carries application scope (path/query), while host/domain
+    targets intentionally discard it. Keeping those representations separate
+    prevents an infrastructure pivot from silently moving web tests to `/`.
+    """
+    input_type = TOOLS.get(tool_key, {}).get('input', 'raw')
+    explicit_urls = [to_url(value) for value in target_list if to_url(value)]
+    if input_type == 'url':
+        values = explicit_urls or [to_http_url(value) for value in target_list]
+    elif input_type == 'host':
+        values = [to_host(value) for value in target_list]
+    elif input_type == 'domain':
+        values = []
+        for value in target_list:
+            domain = to_domain(value)
+            if not domain:
+                continue
+            host = urlsplit(f'//{domain}').hostname or domain
+            try:
+                ipaddress.ip_address(host)
+                continue  # Wayback/GAU/subdomain tooling is meaningless for IP literals.
+            except ValueError:
+                values.append(domain)
+    else:
+        values = target_list
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def merge_pipeline_targets(initial_target, current_targets, pivots):
+    """Keep the authorized application URL while accumulating discoveries."""
+    values = [initial_target, *current_targets, *(p['value'] for p in pivots)]
+    return list(dict.fromkeys(value for value in values if value))
+
+
 def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     all_extracted = []
     stage_results = {}
@@ -2571,7 +2751,12 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
         wait_time = random.uniform(1.5, 4.2)
         time.sleep(wait_time)
 
-        for raw_target in target_list:
+        routed_targets = targets_for_tool(tool_key, target_list)
+        if not routed_targets:
+            socketio.emit('tool_skip', {'scan_id': scan_id, 'tool': tool_key,
+                'reason': 'Nenhum alvo compatível com o tipo de entrada da ferramenta'}, room=sid)
+            continue
+        for raw_target in routed_targets:
             raw, extracted = run_tool_sequential(scan_id, tool_key, raw_target, sid)
             key = f"{tool_key}::{raw_target}"
             stage_results[key] = {'raw': raw, 'targets': extracted}
@@ -2593,6 +2778,50 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     }, room=sid)
 
     return stage_results, unique
+
+def normalize_pivots(initial_target, pivots):
+    """Turn discovered paths into same-origin URLs and remove duplicates.
+
+    Content discovery tools commonly return `/admin` even when the application
+    lives below `/app/`. Passing that raw path to the next stage makes every
+    URL-based tool skip it as invalid. Resolve it relative to the initial
+    application path while retaining explicit host/URL pivots for scope review.
+    """
+    base = to_url(initial_target) or to_http_url(initial_target)
+    if not base:
+        return _dedup_assets(pivots)
+    parsed = urlsplit(base)
+    origin = urlunsplit((parsed.scheme, parsed.netloc, '/', '', ''))
+    app_prefix = parsed.path or '/'
+    if not base.endswith('/') and not parsed.query:
+        base += '/'
+    normalized = []
+    for pivot in pivots:
+        item = dict(pivot)
+        value = str(item.get('value', ''))
+        # Crawlers sometimes turn documentation text such as
+        # /var/www/html/index.html into a URL. It is a local filesystem path,
+        # not a web discovery, and must never become a scan pivot.
+        candidate_path = urlsplit(value).path if to_url(value) else value
+        if re.match(r'^/(?:var/www|etc|usr|opt|home)(?:/|$)', candidate_path, re.I):
+            continue
+        if item.get('type') == 'path':
+            if value.startswith(app_prefix):
+                candidate = urljoin(origin, value.lstrip('/'))
+            else:
+                candidate = urljoin(base, value.lstrip('/'))
+            candidate = scoped_url(initial_target, candidate)
+            if not candidate:
+                continue
+            item.update(value=candidate, label=candidate[:80], type='url')
+        normalized.append(item)
+    return _dedup_assets(normalized)
+
+def pivot_expands_host(initial_target, pivots):
+    """Require review when a pivot changes host/port from the initial asset."""
+    initial_host = (to_host(initial_target) or '').lower()
+    return any((to_host(p.get('value', '')) or '').lower() not in ('', initial_host)
+               for p in pivots)
 
 def run_ai_pipeline(scan_id, sid):
     scan = active_scans[scan_id]
@@ -2673,13 +2902,15 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
 
         if i < len(stages) - 1 and not pipeline_def.get('profile_segmented'):
             # Só pivota em alvos acionáveis (host/url/path). Findings nunca viram alvo.
-            pivots = [t for t in extracted if t.get('type') in ('host', 'url', 'path')]
+            raw_pivots = [t for t in extracted if t.get('type') in ('host', 'url', 'path')]
+            pivots = normalize_pivots(initial_target, raw_pivots) if raw_pivots else []
             if pivots:
-                # Auto-aprovação: poucos pivôs e nenhum finding crítico/alto ainda
+                # Continue automatically only for a bounded set on the original
+                # host. Findings increase priority; they do not halt validation.
                 summ = db_summary(scan_id)
                 sev  = summ.get('severity', {})
-                has_critical = (sev.get('critical', 0) + sev.get('high', 0)) > 0
-                auto_approve = (len(pivots) <= AUTO_CHECKPOINT_THRESHOLD and not has_critical)
+                scope_expansion = pivot_expands_host(initial_target, pivots)
+                auto_approve = (len(pivots) <= AUTO_CHECKPOINT_THRESHOLD and not scope_expansion)
 
                 if auto_approve:
                     socketio.emit('checkpoint_auto', {
@@ -2688,9 +2919,10 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
                         'after_stage_name': stage['name'],
                         'next_stage': stages[i+1]['name'],
                         'approved_count': len(pivots),
-                        'reason': f'{len(pivots)} pivôs, sem critical/high — continuando automaticamente',
+                        'reason': f'{len(pivots)} pivôs na origem autorizada — continuando automaticamente',
                     }, room=sid)
-                    current_targets = [p['value'] for p in pivots]
+                    current_targets = merge_pipeline_targets(
+                        initial_target, current_targets, pivots)
                     continue
 
                 # Checkpoint manual: muitos pivôs ou findings críticos encontrados
@@ -2710,11 +2942,48 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
                     'total': len(pivots),
                     'manual_followups': list(set(all_followups)),
                     'critical_high_count': sev.get('critical', 0) + sev.get('high', 0),
+                    'scope_expansion': scope_expansion,
                 }, room=sid)
                 return
             # Sem novos pivôs: segue para o próximo estágio no(s) mesmo(s) alvo(s).
 
     _finish(scan_id, all_results, initial_target, all_followups, sid)
+
+def run_pipeline_guarded(scan_id, pipeline_def, initial_target, custom_stages, sid, intensity='full'):
+    """Run a pipeline without leaving the UI waiting when a worker crashes.
+
+    Tool failures are normally represented by run_tool_sequential outcomes. This
+    boundary handles infrastructure failures (database/filesystem/programming
+    errors) that would otherwise terminate the daemon thread silently.
+    """
+    try:
+        run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, intensity)
+    except Exception as exc:
+        message = f'{type(exc).__name__}: {exc}'
+        scan = active_scans.get(scan_id)
+        if scan is not None:
+            scan.update(status='failed', error=message)
+            for process in list(scan.get('processes', {}).values()):
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                except Exception:
+                    pass
+        try:
+            db_finish_scan(scan_id, 'failed')
+        except (sqlite3.Error, OSError):
+            pass
+        socketio.emit('pipeline_error', {
+            'scan_id': scan_id,
+            'message': f'Pipeline interrompido por falha interna: {message}',
+        }, room=sid)
+        socketio.emit('pipeline_complete', {
+            'scan_id': scan_id,
+            'result_file': '',
+            'status': 'failed',
+            'manual_checklist': MANUAL_CHECKLIST,
+            'manual_followups': [],
+        }, room=sid)
 
 def _finish(scan_id, all_results, target, followups, sid):
     ai_report = active_scans.get(scan_id, {}).get('ai_report')
@@ -2736,6 +3005,13 @@ def _finish(scan_id, all_results, target, followups, sid):
             'timestamp': datetime.now().isoformat(),
         }, f, indent=2)
 
+    # Persist completion before telling the UI it is done. If persistence fails,
+    # the guarded worker emits one explicit failed completion instead of leaving
+    # a misleading successful scan in the browser.
+    db_finish_scan(scan_id, completion_status)
+    if scan_id in active_scans:
+        active_scans[scan_id]['status'] = completion_status
+
     socketio.emit('pipeline_complete', {
         'scan_id': scan_id,
         'result_file': str(result_file),
@@ -2743,10 +3019,6 @@ def _finish(scan_id, all_results, target, followups, sid):
         'manual_checklist': MANUAL_CHECKLIST,
         'manual_followups': list(set(followups)),
     }, room=sid)
-
-    db_finish_scan(scan_id, completion_status)
-    if scan_id in active_scans:
-        active_scans[scan_id]['status'] = completion_status
 
     # Webhook de notificação (Slack/Discord/custom)
     if WEBHOOK_URL:
@@ -3317,16 +3589,27 @@ def on_start(data):
 
     scan_id = str(uuid.uuid4())[:8]
     pipeline_def = PIPELINES.get(pipeline_key, {})
+    try:
+        # Do not announce/store a scan in memory until durable state is writable.
+        # Previously a readonly SQLite database raised out of the Socket.IO
+        # handler, leaving the browser waiting forever without an error event.
+        db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
+                       proxy_status().get('profile', 'none'))
+        host_store.ensure(target, scan_id)
+    except (sqlite3.Error, OSError) as exc:
+        emit('error', {'message': (
+            f'Não foi possível iniciar o scan: armazenamento sem escrita em {DB_PATH} '
+            f'({exc}). Execute pela instalação recomendada ou defina RECONX_RESULTS '
+            'para um diretório gravável.'
+        )})
+        return
+
     active_scans[scan_id] = {
         'processes': {}, 'cancelled': False,
         'status': 'running', 'target': target, 'sid': sid, 'intensity': data.get('intensity', 'full'),
         'login_testing': login_config,
         'ai_config': ai_config,
     }
-    db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
-                   proxy_status().get('profile', 'none'))
-    host_store.ensure(target, scan_id)
-
     emit('pipeline_started', {
         'scan_id': scan_id, 'target': target, 'host_id': host_id,
         'pipeline': pipeline_def.get('label', 'Custom'),
@@ -3348,7 +3631,7 @@ def on_start(data):
 
     intensity = data.get('intensity', 'full')
     threading.Thread(
-        target=run_pipeline,
+        target=run_pipeline_guarded,
         args=(scan_id, pipeline_def, target, custom_stages, sid, intensity),
         daemon=True
     ).start()
@@ -3423,7 +3706,9 @@ def on_approve(data):
     })
 
     def resume():
-        current = approved
+        current = merge_pipeline_targets(
+            initial_target, [initial_target],
+            [{'value': value} for value in approved])
         for i, stage in enumerate(remaining):
             if scan.get('cancelled'): break
             sr, extracted = run_stage(scan_id, stage, current, sid, scan.get('intensity', 'full'))
@@ -3431,7 +3716,8 @@ def on_approve(data):
             for tk in stage['tools']:
                 all_followups.extend(TOOLS.get(tk, {}).get('manual_followup', []))
             if i < len(remaining) - 1:
-                pivots = [t for t in extracted if t.get('type') in ('host', 'url', 'path')]
+                raw_pivots = [t for t in extracted if t.get('type') in ('host', 'url', 'path')]
+                pivots = normalize_pivots(initial_target, raw_pivots) if raw_pivots else []
                 if pivots:
                     scan.update({'status':'checkpoint','remaining_stages':remaining[i+1:],
                         'all_results':all_results,'all_followups':all_followups,

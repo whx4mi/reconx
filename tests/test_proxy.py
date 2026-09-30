@@ -5,6 +5,7 @@ replace only external effects (tools, sockets, database and Socket.IO).
 Run: python -m unittest discover -s tests -v
 """
 import ast
+import os
 from pathlib import Path
 import random
 import re
@@ -16,7 +17,7 @@ import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 
 def load_helpers():
@@ -24,7 +25,9 @@ def load_helpers():
     functions = {'check_proxy_alive', '_proxy_url_if_alive', '_tool_proxy_url',
                  'proxy_status', 'inject_proxy', 'proxy_env', 'to_host', 'to_domain',
                  'to_url', 'to_http_url', 'build_cmd', '_record_host_attempt', 'run_tool_sequential',
-                 'run_verification', 'api_retest'}
+                 'run_verification', 'api_retest', '_projectdiscovery_httpx',
+                 'resolve_binary', 'check_binary', 'browser_validate_xss',
+                 'validate_dalfox_findings'}
     nodes = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in functions:
@@ -34,7 +37,8 @@ def load_helpers():
                 isinstance(t, ast.Name) and t.id in {'TOOLS', 'PROXY_PROFILES', 'USER_AGENTS'}
                 for t in node.targets):
             nodes.append(node)
-    ns = dict(Path=Path, re=re, socket=socket, urlsplit=urlsplit, random=random, sqlite3=sqlite3,
+    ns = dict(Path=Path, re=re, socket=socket, urlsplit=urlsplit, urlunsplit=urlunsplit,
+              parse_qsl=parse_qsl, urlencode=urlencode, random=random, os=os, sqlite3=sqlite3,
               subprocess=subprocess, shutil=shutil, threading=threading, time=time,
               WL_COMMON=None, WL_SMALL=None, WL_DNS=None, SCREENS_DIR=Path('/tmp/screens'),
               DEFAULT_TOOL_TIMEOUT=10, VERIFY_TIMEOUT=10, VERIFY_MAX_OUTPUT=4000,
@@ -43,7 +47,6 @@ def load_helpers():
                         'no_proxy': 'localhost'},
               active_proxy={'profile': 'none', 'http': None, 'socks': None},
               active_scans={'scan': {'processes': {}}}, socketio=MagicMock(),
-              check_binary=MagicMock(return_value=True),
               strip_ansi=lambda s: s, _is_stream_noise=lambda s: False,
               _save_tool_output=MagicMock(), _scan_output_dir=lambda s: Path('/tmp'),
               parse_output=lambda *a: ([], []), persist_and_emit_findings=MagicMock(),
