@@ -2796,7 +2796,8 @@ def run_adaptive_web(scan_id, targets, sid):
         report['reverse_engineering'] = reverse_engineer(
             initial, pages, fetch, max_scripts=report['limits']['scripts'],
             max_source_maps=report['limits']['source_maps'],
-            cancelled=lambda: scan.get('cancelled', False))
+            cancelled=lambda: scan.get('cancelled', False),
+            jsluice_binary=resolve_binary('jsluice'))
         reverse_summary = report['reverse_engineering']['summary']
         log('[Reverse] '
             f"{reverse_summary['scripts_analyzed']} scripts, "
@@ -3617,6 +3618,13 @@ def build_markdown_report(d: dict, findings=None, summary=None) -> str:
         frameworks = reverse.get('frameworks', [])
         if frameworks:
             lines.append(f"- Frameworks/bundlers observados: {', '.join(map(str, frameworks))}.")
+        analyzers = reverse.get('analyzers', {})
+        if analyzers:
+            available = [name for name, state in analyzers.items() if state.get('available')]
+            unavailable = [name for name, state in analyzers.items() if not state.get('available')]
+            lines.append(f"- Analisadores disponíveis: {', '.join(available) or 'nenhum'}.")
+            if unavailable:
+                lines.append(f"- Analisadores ausentes: {', '.join(unavailable)} (lacuna de cobertura).")
         operations = reverse.get('graphql_operations', [])
         if operations:
             lines.append("- Operações GraphQL: " + ', '.join(
@@ -3627,9 +3635,14 @@ def build_markdown_report(d: dict, findings=None, summary=None) -> str:
         for endpoint in reverse.get('endpoints', []):
             scope = 'no escopo' if endpoint.get('in_scope') else 'referência externa'
             sources = ', '.join(map(str, endpoint.get('sources', []))) or 'origem não registrada'
+            query = ', '.join(map(str, endpoint.get('query_parameters', [])))
+            body = ', '.join(map(str, endpoint.get('body_parameters', [])))
+            parameters = '; '.join(part for part in (
+                f'query: {query}' if query else '', f'body: {body}' if body else '') if part)
+            parameters = f'; parâmetros {parameters}' if parameters else ''
             lines.append(
                 f"- `{endpoint.get('method', '?')}` `{endpoint.get('url', '?')}` "
-                f"({endpoint.get('kind', 'http')}; {scope}) ← `{sources}`")
+                f"({endpoint.get('kind', 'http')}; {scope}{parameters}) ← `{sources}`")
         for source_map in reverse.get('source_maps', []):
             sources = ', '.join(map(str, source_map.get('sources', []))) or 'nenhuma fonte declarada'
             lines.append(

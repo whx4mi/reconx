@@ -16,6 +16,9 @@ os caminhos, query strings e campos duplicados.
 
 A mesma etapa coleta, com limites, os `<script src>` da origem autorizada e
 analisa scripts inline, bundles JavaScript e source maps sem executar código.
+Quando `jsluice` está instalado, o mesmo conteúdo já baixado pelo ReconX também
+passa por análise AST complementar. O código é entregue ao processo por `stdin`:
+o analisador não refaz a requisição e não pode ampliar a origem autorizada.
 O bloco `reverse_engineering` do `adaptive_report.json` correlaciona:
 
 - scripts analisados, tamanho e SHA-256;
@@ -24,6 +27,7 @@ O bloco `reverse_engineering` do `adaptive_report.json` correlaciona:
 - sinais de autenticação, papéis/permissões, tenancy, identificadores e ações
   de negócio;
 - relações `artefato → operação → endpoint`;
+- analisadores efetivamente disponíveis e nomes de parâmetros GET/POST extraídos;
 - árvore de fontes revelada por source maps, sem copiar `sourcesContent`.
 
 Scripts e endpoints externos são inventariados, mas nunca buscados ou tratados

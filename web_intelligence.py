@@ -4,6 +4,7 @@ from html.parser import HTMLParser
 import hashlib
 import json
 import re
+import subprocess
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 
 TOKEN = re.compile(r'csrf|xsrf|token|nonce', re.I)
@@ -211,19 +212,66 @@ def _script_provenance(source_url):
     return 'application'
 
 
-def analyze_javascript(initial_url, source_url, source):
+def _jsluice_endpoints(initial_url, source_url, resolution_url, source, binary):
+    """Analyze already-fetched JavaScript without allowing an independent fetch."""
+    if not binary:
+        return [], None
+    try:
+        process = subprocess.run(
+            [binary, 'urls', '--raw-input', '--resolve-paths', resolution_url,
+             '--unique', '--ignore-strings'],
+            input=source, capture_output=True, text=True, timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f'jsluice não executado: {exc}'
+    if process.returncode:
+        return [], f'jsluice terminou com código {process.returncode}'
+
+    endpoints, invalid = [], 0
+    for line in process.stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            invalid += 1
+            continue
+        value = _template_url(str(item.get('url') or ''))
+        method = str(item.get('method') or 'GET').upper()
+        if not value or method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE',
+                                       'HEAD', 'OPTIONS'):
+            continue
+        endpoints.append({
+            'method': method,
+            'url': value,
+            'kind': f"jsluice:{str(item.get('type') or 'ast')}",
+            'in_scope': scoped_url(initial_url, value) is not None,
+            'source': source_url,
+            'query_parameters': list(dict.fromkeys(
+                str(name) for name in item.get('queryParams', []) if name))[:100],
+            'body_parameters': list(dict.fromkeys(
+                str(name) for name in item.get('bodyParams', []) if name))[:100],
+            'detectors': ['jsluice'],
+        })
+    warning = f'jsluice ignorou {invalid} linha(s) não JSON' if invalid else None
+    return endpoints, warning
+
+
+def analyze_javascript(initial_url, source_url, source, jsluice_binary=None,
+                       resolution_url=None):
     """Extract architecture signals from JavaScript as data, never as findings."""
     endpoints = []
+    resolution_url = resolution_url or source_url
+    provenance = _script_provenance(source_url)
 
     def add(method, value, kind):
         value = _template_url(value)
         if not value or value.startswith(('data:', 'javascript:', '#')):
             return
-        resolved = urljoin(source_url, value) if not value.startswith(('ws://', 'wss://')) else value
+        resolved = urljoin(resolution_url, value) if not value.startswith(('ws://', 'wss://')) else value
         endpoints.append({
             'method': method.upper(), 'url': resolved, 'kind': kind,
             'in_scope': scoped_url(initial_url, resolved) is not None,
-            'source': source_url,
+            'source': source_url, 'detectors': ['builtin'],
         })
 
     for match in _JS_HTTP_CALL.finditer(source):
@@ -253,23 +301,44 @@ def analyze_javascript(initial_url, source_url, source):
                   if pattern.search(source) or pattern.search(source_url)]
     operations = [{'type': kind.lower(), 'name': name}
                   for kind, name in _GRAPHQL_OPERATION.findall(source)][:100]
+    supplemental, warning = ([], None)
+    if provenance != 'vendor':
+        supplemental, warning = _jsluice_endpoints(
+            initial_url, source_url, resolution_url, source, jsluice_binary)
+    for candidate in supplemental:
+        existing = next((item for item in endpoints
+                         if item['method'] == candidate['method']
+                         and item['url'] == candidate['url']), None)
+        if existing:
+            existing['detectors'] = list(dict.fromkeys(
+                existing.get('detectors', []) + candidate['detectors']))
+            for field in ('query_parameters', 'body_parameters'):
+                existing[field] = list(dict.fromkeys(
+                    existing.get(field, []) + candidate.get(field, [])))
+        else:
+            endpoints.append(candidate)
     return {
-        'source': source_url, 'provenance': _script_provenance(source_url),
+        'source': source_url, 'provenance': provenance,
         'endpoints': endpoints,
         'source_maps': list(dict.fromkeys(source_maps)),
         'signals': signals,
         'frameworks': frameworks,
         'graphql_operations': operations,
+        'jsluice_warning': warning,
     }
 
 
 def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=8,
-                       cancelled=lambda: False):
+                       cancelled=lambda: False, jsluice_binary=None):
     """Build a bounded static model from HTML, JS bundles and source maps."""
     report = {
         'scripts': [], 'external_scripts': [], 'source_maps': [], 'endpoints': [],
         'frameworks': [], 'signals': {name: [] for name in _SIGNALS},
         'graphql_operations': [], 'architecture_edges': [], 'errors': [],
+        'analyzers': {
+            'builtin': {'available': True, 'mode': 'static'},
+            'jsluice': {'available': bool(jsluice_binary), 'mode': 'AST/static'},
+        },
         'limits': {'scripts': max_scripts, 'source_maps': max_source_maps},
         'truncated': False,
         'limitations': [
@@ -278,14 +347,21 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
             'Sinais de identidade, autorização e negócio são hipóteses de arquitetura, não vulnerabilidades',
         ],
     }
+    if not jsluice_binary:
+        report['limitations'].append(
+            'jsluice não disponível; extração AST complementar de endpoints não executada')
     analyses = []
     script_urls = []
+    script_bases = {}
     for page in pages:
         for index, source in enumerate(page.scripts, 1):
-            analyses.append(analyze_javascript(initial_url, f'{page.url}#inline-{index}', source))
+            analyses.append(analyze_javascript(
+                initial_url, f'{page.url}#inline-{index}', source, jsluice_binary,
+                resolution_url=page.url))
         for url in page.script_sources:
             if scoped_url(initial_url, url):
                 script_urls.append(url)
+                script_bases.setdefault(url, page.url)
             else:
                 report['external_scripts'].append(url)
     script_urls = list(dict.fromkeys(script_urls))
@@ -309,7 +385,9 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
             report['scripts'].append({'url': url, 'provenance': _script_provenance(url),
                                       'bytes': len(source.encode('utf-8')),
                                       'sha256': hashlib.sha256(source.encode()).hexdigest()})
-            analyses.append(analyze_javascript(initial_url, url, source))
+            analyses.append(analyze_javascript(
+                initial_url, url, source, jsluice_binary,
+                resolution_url=script_bases.get(url, initial_url)))
         except (ValueError, OSError, RuntimeError) as exc:
             report['errors'].append({'url': url, 'reason': str(exc)})
 
@@ -338,7 +416,15 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
             report['errors'].append({'url': url, 'reason': f'Source map inválido: {exc}'})
 
     endpoint_index = {}
+    report['analyzers']['jsluice']['sources_analyzed'] = sum(
+        1 for analysis in analyses
+        if jsluice_binary and analysis['provenance'] != 'vendor')
+    report['analyzers']['jsluice']['failures'] = sum(
+        1 for analysis in analyses if analysis.get('jsluice_warning'))
     for analysis in analyses:
+        if analysis.get('jsluice_warning'):
+            report['errors'].append({
+                'url': analysis['source'], 'reason': analysis['jsluice_warning']})
         report['frameworks'].extend(analysis['frameworks'])
         if analysis['provenance'] == 'vendor':
             continue
@@ -350,6 +436,11 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
             item = endpoint_index.setdefault(key, {k: v for k, v in endpoint.items() if k != 'source'} |
                                                    {'sources': []})
             item['sources'].append(endpoint['source'])
+            item['detectors'] = list(dict.fromkeys(
+                item.get('detectors', []) + endpoint.get('detectors', [])))
+            for field in ('query_parameters', 'body_parameters'):
+                item[field] = list(dict.fromkeys(
+                    item.get(field, []) + endpoint.get(field, [])))
     for item in endpoint_index.values():
         item['sources'] = list(dict.fromkeys(item['sources']))
         report['endpoints'].append(item)

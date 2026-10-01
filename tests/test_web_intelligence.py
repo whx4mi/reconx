@@ -148,6 +148,49 @@ class WebIntelligenceTests(unittest.TestCase):
             'status': 200, 'body': source, 'content_type': 'application/javascript'})
         self.assertEqual(report['graphql_operations'], [{'type': 'query', 'name': 'Viewer'}])
 
+    @patch('web_intelligence.subprocess.run')
+    def test_jsluice_ast_adds_structured_endpoint_without_refetching(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({
+                'url': BASE + 'api/invite', 'queryParams': [],
+                'bodyParams': ['userId', 'role'], 'method': 'POST',
+                'type': '$.post', 'source': 'must-not-be-retained',
+            }) + '\n', stderr='')
+        page = parse_page(BASE, '<script src="js/app.js"></script>')
+        report = reverse_engineer(
+            BASE, [page], lambda url: {
+                'status': 200, 'body': '$.post("api/invite", payload)',
+                'content_type': 'application/javascript'},
+            jsluice_binary='/usr/local/bin/jsluice')
+
+        endpoint = next(item for item in report['endpoints']
+                        if item['url'] == BASE + 'api/invite')
+        self.assertEqual(endpoint['method'], 'POST')
+        self.assertEqual(endpoint['body_parameters'], ['userId', 'role'])
+        self.assertEqual(endpoint['detectors'], ['jsluice'])
+        self.assertTrue(report['analyzers']['jsluice']['available'])
+        self.assertNotIn('source', endpoint)
+        args, kwargs = run.call_args
+        self.assertEqual(kwargs['input'], '$.post("api/invite", payload)')
+        self.assertIn('--raw-input', args[0])
+        self.assertEqual(args[0][args[0].index('--resolve-paths') + 1],
+                         BASE)
+        self.assertEqual(args[0][-1], '--ignore-strings')
+
+    def test_reverse_engineering_records_missing_optional_ast_analyzer(self):
+        report = reverse_engineer(BASE, [], lambda url: None)
+        self.assertFalse(report['analyzers']['jsluice']['available'])
+        self.assertTrue(any('jsluice não disponível' in item
+                            for item in report['limitations']))
+
+    def test_bundle_relative_endpoint_resolves_against_document_not_script(self):
+        page = parse_page(BASE, '<script src="assets/main.js"></script>')
+        report = reverse_engineer(BASE, [page], lambda url: {
+            'status': 200, 'body': 'fetch("api/items")',
+            'content_type': 'application/javascript'})
+        self.assertEqual(report['endpoints'][0]['url'], BASE + 'api/items')
+
     def test_crawler_follows_local_links_and_preserves_queries(self):
         fetched = []
         def fetch(url):

@@ -135,6 +135,8 @@ sudo ./install.sh
 ```
 
 O instalador preserva resultados existentes por padrão e tenta instalar as ferramentas suportadas.
+Entre as integrações opcionais, `jsluice` complementa a engenharia reversa de
+JavaScript com análise AST de endpoints e parâmetros sem executar o código.
 Para instalar somente a aplicação:
 
 ```bash

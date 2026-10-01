@@ -111,7 +111,11 @@ echo ""
 
 # ── Cria estrutura ─────────────────────────────────────────────────
 info "Criando estrutura de diretórios..."
-mkdir -p "$APP_DIR/templates" "$RESULTS_DIR/sqlmap" "$RESULTS_DIR/screenshots"
+mkdir -p "$APP_DIR/templates" "$RESULTS_DIR/sqlmap" "$RESULTS_DIR/screenshots" "$RESULTS_DIR/.tmp"
+chmod 700 "$RESULTS_DIR/.tmp"
+# Compiladores Go e outras ferramentas também precisam escapar de /tmp pequeno.
+export TMPDIR="$RESULTS_DIR/.tmp"
+export GOTMPDIR="$RESULTS_DIR/.tmp"
 ok "Diretórios em $APP_DIR"
 
 # ── Copia arquivos ─────────────────────────────────────────────────
@@ -294,6 +298,7 @@ GO_TOOLS=(
     "waybackurls:github.com/tomnomnom/waybackurls@latest"
     "gau:github.com/lc/gau/v2/cmd/gau@latest"
     "dalfox:github.com/hahwul/dalfox/v2@latest"
+    "jsluice:github.com/BishopFox/jsluice/cmd/jsluice@v0.0.0-20240110145140-0ddfab153e06"
     "anew:github.com/tomnomnom/anew@latest"
     "gowitness:github.com/sensepost/gowitness@latest"
 )
@@ -456,7 +461,7 @@ echo -e "    4. Para HTTPS: instale o cert em ${YELLOW}http://burp/cert${NC}"
 echo ""
 # Checklist de binários críticos
 echo -e "  ${CYAN}Verificando binários disponíveis:${NC}"
-ALL_BINS=(nmap curl nikto sqlmap nuclei httpx subfinder ffuf dalfox commix corsy jwt_tool redis-cli mongosh)
+ALL_BINS=(nmap curl nikto sqlmap nuclei httpx subfinder ffuf dalfox jsluice commix corsy jwt_tool redis-cli mongosh)
 MISSING_BINS=()
 for b in "${ALL_BINS[@]}"; do
     if [[ "$b" == "httpx" ]] && ! is_projectdiscovery_httpx; then
