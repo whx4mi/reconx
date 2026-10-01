@@ -166,7 +166,9 @@ _XHR_OPEN = re.compile(
 _STREAM_CALL = re.compile(r'new\s+(WebSocket|EventSource)\s*\(\s*([\'"`])(.*?)\2', re.I | re.S)
 _FRONTEND_ROUTE = re.compile(r'\bpath\s*:\s*([\'"`])(/[^\'"`\s]+)\1', re.I)
 _SOURCE_MAP = re.compile(r'[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)', re.I)
-_GRAPHQL_OPERATION = re.compile(r'\b(query|mutation|subscription)\s+([A-Za-z_]\w*)')
+_GRAPHQL_OPERATION = re.compile(
+    r'\b(query|mutation|subscription)\s+([A-Za-z_]\w*)\s*'
+    r'(?:\([^{}]*\)\s*)?\{')
 
 _SIGNALS = {
     'authentication': re.compile(

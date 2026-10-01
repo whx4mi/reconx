@@ -138,6 +138,16 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual(report['endpoints'], [])
         self.assertEqual(report['signals']['authorization'], [])
 
+    def test_graphql_operation_requires_an_operation_body(self):
+        page = parse_page(BASE, '<script src="js/app.js"></script>')
+        source = '''
+            // Prefer feature detection instead of relying on media-query support.
+            query Viewer($id: ID!) { viewer(id: $id) { id } }
+        '''
+        report = reverse_engineer(BASE, [page], lambda url: {
+            'status': 200, 'body': source, 'content_type': 'application/javascript'})
+        self.assertEqual(report['graphql_operations'], [{'type': 'query', 'name': 'Viewer'}])
+
     def test_crawler_follows_local_links_and_preserves_queries(self):
         fetched = []
         def fetch(url):
