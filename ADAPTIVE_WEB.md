@@ -35,6 +35,10 @@ Bundles e mapas aceitam até 4 MiB por artefato por padrão; ajuste com
 `RECONX_REVERSE_MAX_BYTES` até 16 MiB. Páginas HTML continuam limitadas a
 512 KiB.
 
+Perfis temporários de navegadores e scanners são criados em `.tmp` dentro do
+diretório de resultados, evitando depender de uma partição `/tmp` pequena.
+`RECONX_TMPDIR` permite selecionar outro diretório gravável quando necessário.
+
 URLs parametrizadas recebem testes SQLMap/Dalfox. Formulários GET/POST
 recebem testes com os nomes e valores dos campos, botão de envio e cookies
 da descoberta. Antes de cada teste o formulário é lido novamente; SQLMap

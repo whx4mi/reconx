@@ -11,6 +11,18 @@ import app as reconx
 
 
 class PipelineResilienceTests(unittest.TestCase):
+    def test_database_context_closes_connection(self):
+        with reconx._db() as connection:
+            connection.execute('SELECT 1').fetchone()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute('SELECT 1')
+
+    def test_runtime_temp_directory_lives_beside_results(self):
+        self.assertEqual(reconx.RUNTIME_TMP_DIR, reconx.RESULTS_DIR / '.tmp')
+        self.assertEqual(tempfile.gettempdir(), str(reconx.RUNTIME_TMP_DIR))
+        self.assertEqual(reconx.proxy_env('curl', {})['TMPDIR'],
+                         str(reconx.RUNTIME_TMP_DIR))
+
     def test_reports_render_reverse_engineering_map_and_escape_html(self):
         data = {
             'target': 'http://lab.test/app/', 'scan_id': 'map-test',
@@ -163,8 +175,51 @@ class PipelineResilienceTests(unittest.TestCase):
 
         sqlmap_positive = "[INFO] GET parameter 'id' appears to be 'AND boolean-based blind' injectable"
         commix_positive = "[info] The POST parameter 'd' appears to be injectable via classic injection"
-        self.assertEqual(len(reconx.parse_output('sqlmap_url', sqlmap_positive, 'http://lab.test/')[1]), 1)
-        self.assertEqual(len(reconx.parse_output('commix', commix_positive, 'http://lab.test/')[1]), 1)
+        sqlmap_finding = reconx.parse_output('sqlmap_url', sqlmap_positive, 'http://lab.test/')[1]
+        commix_finding = reconx.parse_output('commix', commix_positive, 'http://lab.test/')[1]
+        self.assertEqual(len(sqlmap_finding), 1)
+        self.assertEqual(len(commix_finding), 1)
+        self.assertEqual(sqlmap_finding[0]['confidence'], 'likely')
+        self.assertEqual(commix_finding[0]['confidence'], 'likely')
+
+    def test_root_cause_dedup_preserves_strongest_severity_and_confidence(self):
+        scan_id = f'dedup-{uuid.uuid4().hex}'
+        reconx.db_create_scan(scan_id, 'http://lab.test/app/', 'test', 'none')
+        first = reconx._finding('curl_headers', 'headers',
+            'Security headers ausentes: Content-Security-Policy', 'low',
+            'http://lab.test/app/', 'curl', 'possible')
+        second = reconx._finding('nuclei_misconfig', 'vuln',
+            'HTTP Missing Security Headers', 'info',
+            'http://lab.test/app/login.php', 'nuclei', 'likely')
+        phpinfo_a = reconx._finding('nikto', 'nikto',
+            '+ [002989] /app/phpinfo.php: phpinfo() was found', 'info',
+            'http://lab.test/app', 'nikto', 'possible')
+        phpinfo_b = reconx._finding('nuclei_misconfig', 'info',
+            'PHPInfo exposto publicamente', 'low',
+            'http://lab.test/app//phpinfo.php', 'nuclei', 'confirmed')
+        try:
+            reconx.persist_and_emit_findings(scan_id, [], [first, second, phpinfo_a, phpinfo_b], 'sid')
+            findings = reconx.db_findings(scan_id)
+            self.assertEqual(len(findings), 2)
+            headers = next(item for item in findings if 'Headers' in item['name'])
+            phpinfo = next(item for item in findings if 'PHPInfo' in item['name'])
+            self.assertEqual((headers['severity'], headers['confidence']), ('low', 'likely'))
+            self.assertEqual((phpinfo['severity'], phpinfo['confidence']), ('low', 'confirmed'))
+        finally:
+            with reconx._db_lock, reconx._db() as connection:
+                connection.execute('DELETE FROM findings WHERE scan_id=?', (scan_id,))
+                connection.execute('DELETE FROM scans WHERE scan_id=?', (scan_id,))
+
+    def test_finding_identity_normalizes_trailing_and_repeated_slashes(self):
+        a = reconx._finding_identity('nikto', 'nikto', 'same', 'http://LAB.test/app/')
+        b = reconx._finding_identity('nikto', 'nikto', 'same', 'http://lab.test/app')
+        self.assertEqual(a, b)
+        a = reconx._finding_identity('nuclei', 'info', 'PHPInfo exposed',
+                                     'http://lab.test/app//phpinfo.php')
+        b = reconx._finding_identity('nikto', 'nikto',
+                                     '/app/phpinfo.php: phpinfo() was found',
+                                     'http://lab.test/app/')
+        self.assertEqual(a, b)
 
     def test_nikto_keeps_checks_but_not_metadata_or_false_positive_warning(self):
         raw = '''+ Platform: Linux/Unix

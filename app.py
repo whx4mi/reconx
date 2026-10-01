@@ -26,6 +26,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import tempfile
 import http.cookiejar
 import urllib.request
+from contextlib import contextmanager
 from web_intelligence import (discover, plan_tests, parse_page, form_request,
                               scoped_url, reverse_engineer)
 from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
@@ -40,6 +41,14 @@ RESULTS_DIR = Path(os.environ.get('RECONX_RESULTS', '/opt/reconx/results'))
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 SCREENS_DIR = RESULTS_DIR / "screenshots"
 SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+# Browsers and scanners can consume more space than a small system /tmp. Keep
+# their temporary profiles beside the result store, which is already required
+# to be writable and is covered by the operator's storage policy.
+RUNTIME_TMP_DIR = Path(os.environ.get('RECONX_TMPDIR') or RESULTS_DIR / '.tmp')
+RUNTIME_TMP_DIR.mkdir(parents=True, exist_ok=True)
+RUNTIME_TMP_DIR.chmod(0o700)
+os.environ['TMPDIR'] = str(RUNTIME_TMP_DIR)
+tempfile.tempdir = str(RUNTIME_TMP_DIR)
 
 # Timeout padrão por ferramenta (segundos). Override por tool via campo "timeout".
 DEFAULT_TOOL_TIMEOUT = int(os.environ.get('RECONX_TIMEOUT', '600'))
@@ -86,10 +95,15 @@ CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_asset_scan ON assets(scan_id);
 """
 
+@contextmanager
 def _db():
     con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 def db_init():
     with _db_lock, _db() as c:
@@ -110,10 +124,35 @@ def db_finish_scan(scan_id, status='done'):
 
 def _finding_identity(tool, ftype, name, target):
     """Collapse scanner aliases that describe the same vulnerable input."""
+    target = str(target or '')
+    host = (to_host(target) or '').lower()
+    name_lower = str(name or '').lower()
+    if host and re.search(
+            r'security headers? (?:ausentes|missing)|http missing security headers|'
+            r'suggested security header missing|x-frame-options header is deprecated|'
+            r'x-content-type-options header is not set', name_lower):
+        return f'http_security_headers|{host}'
+    if host and 'cookie' in name_lower:
+        flag = next((value for value in ('httponly', 'samesite', 'secure')
+                     if value in name_lower), '')
+        if flag:
+            return f'cookie_flag|{host}|{flag}'
+    if host and 'subresource integrity' in name_lower:
+        return f'subresource_integrity|{host}'
+    if host and 'phpinfo' in name_lower:
+        try:
+            parsed = urlsplit(target)
+            path_match = re.search(r'(/[\w./-]*phpinfo\.php)', str(name), re.I)
+            path = path_match.group(1) if path_match else parsed.path
+            path = re.sub(r'/+', '/', path).rstrip('/') or '/'
+            return f'phpinfo|{host}|{path.lower()}'
+        except (TypeError, ValueError):
+            return f'phpinfo|{host}'
     if ftype in ('xss', 'open_redirect') and target:
         try:
             parsed = urlsplit(target)
             path = re.sub(r'/index\.php$', '/', parsed.path, flags=re.I)
+            path = re.sub(r'/+', '/', path).rstrip('/') or '/'
             pairs = parse_qsl(parsed.query, keep_blank_values=True)
             suspicious = [key for key, value in pairs if re.search(
                 r'(?i)(?:<svg|onload|onfocus|onclick|class=dlx|oast\.me|^//|^https?://)', value)]
@@ -123,6 +162,14 @@ def _finding_identity(tool, ftype, name, target):
                 return f'{ftype}|{origin}|{path}|{",".join(sorted(set(parameters)))}'
         except (TypeError, ValueError):
             pass
+    try:
+        parsed = urlsplit(target)
+        if parsed.scheme and parsed.netloc:
+            path = re.sub(r'/+', '/', parsed.path).rstrip('/') or '/'
+            target = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(),
+                                 path, parsed.query, ''))
+    except (TypeError, ValueError):
+        pass
     return f'{tool}|{ftype}|{name}|{target}'
 
 
@@ -133,15 +180,23 @@ def db_add_finding(scan_id, tool, ftype, name, severity, target, evidence, confi
     dedup = hashlib.sha1(identity.encode(), usedforsecurity=False).hexdigest()
     with _db_lock, _db() as c:
         previous = c.execute(
-            'SELECT id,confidence FROM findings WHERE scan_id=? AND dedup_key=?',
+            'SELECT id,confidence,severity FROM findings WHERE scan_id=? AND dedup_key=?',
             (scan_id, dedup)).fetchone()
         if previous:
             rank = {'possible': 0, 'likely': 1, 'confirmed': 2}
-            if rank[confidence] > rank.get(previous['confidence'], 0):
+            severity_rank = {value: index for index, value in enumerate(
+                ('unknown', 'info', 'low', 'medium', 'high', 'critical'))}
+            stronger_confidence = rank[confidence] > rank.get(previous['confidence'], 0)
+            stronger_severity = (severity_rank.get(severity, 0) >
+                                 severity_rank.get(previous['severity'], 0))
+            if stronger_confidence or stronger_severity:
+                retained_severity = max((previous['severity'], severity),
+                    key=lambda value: severity_rank.get(value, 0))
                 c.execute('''UPDATE findings SET tool=?,ftype=?,name=?,severity=?,target=?,
                     evidence=?,confidence=? WHERE id=?''',
-                    (tool, ftype, name, severity, target, (evidence or '')[:2000],
-                     confidence, previous['id']))
+                    (tool, ftype, name, retained_severity, target, (evidence or '')[:2000],
+                     max((previous['confidence'], confidence), key=lambda value: rank[value]),
+                     previous['id']))
                 return True, previous['id']
             return False, previous['id']
         cur = c.execute("""INSERT OR IGNORE INTO findings
@@ -1955,7 +2010,8 @@ def _text_findings(tool_key, otype, lines, target=''):
         elif _MED_RE.search(l): sev = 'medium'
         elif _LOW_RE.search(l): sev = 'low'
         else:                   sev = 'info'
-        out.append(_finding(tool_key, otype, l[:160], sev, target, l[:300]))
+        confidence = 'likely' if otype in ('sqli', 'cmdi') else 'possible'
+        out.append(_finding(tool_key, otype, l[:160], sev, target, l[:300], confidence))
     return out
 
 # ══════════════════════════════════════════════════════════════════════════════
