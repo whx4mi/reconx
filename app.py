@@ -2059,7 +2059,9 @@ VERIFY_MAP = [
         'desc': 'Login FTP anonimo e listagem de diretorio',
     },
     {
-        'id': 'sqli', 'match': r'sql\s*inj|sqli|injectable',
+        # Keep this SQL-specific: a Commix "injectable" result must never be
+        # routed to SQLMap merely because both tools use the same adjective.
+        'id': 'sqli', 'match': r'sql\s*inj|\bsqli\b|sqlmap',
         'tool': 'sqlmap', 'needs': ['url'],
         'cmd': ['sqlmap', '-u', '{url}', '--batch', '--level', '2', '--risk', '1',
                 '--smart', '--flush-session', '--disable-coloring', '--timeout', '10'],

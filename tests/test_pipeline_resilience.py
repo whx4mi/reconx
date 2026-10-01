@@ -165,6 +165,12 @@ class PipelineResilienceTests(unittest.TestCase):
         _, findings = reconx.parse_output('commix', raw, 'http://lab.test/app/')
         self.assertEqual(findings, [])
 
+    def test_command_injection_is_not_misrouted_to_sqlmap_verifier(self):
+        finding = reconx._finding('commix', 'cmdi',
+            "POST parameter 'd' appears to be injectable", 'high',
+            'http://lab.test/ping.php', 'time-based command injection', 'likely')
+        self.assertIsNone(reconx.match_verifier(finding))
+
     def test_injection_parsers_require_explicit_positive_evidence(self):
         sqlmap_noise = '''sqlmap identified the target form\n[INFO] testing SQL injection
 [CRITICAL] there were no forms found at the given target URL'''
