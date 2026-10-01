@@ -13,7 +13,8 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from web_intelligence import scoped_url, parse_page, discover, plan_tests, form_request
+from web_intelligence import (scoped_url, parse_page, discover, plan_tests, form_request,
+                              reverse_engineer)
 from test_proxy import load_helpers
 
 BASE = 'http://lab.test:8080/meOwna/'
@@ -88,6 +89,55 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual([job['tool'] for job in jobs], ['sqlmap_url', 'commix'])
         self.assertEqual(pending, [])
 
+    def test_reverse_engineers_bundles_source_maps_and_architecture_without_external_fetch(self):
+        page = parse_page(BASE, '''
+            <script src="js/app.js"></script>
+            <script src="https://cdn.example/vendor.js"></script>
+            <script>fetch('/graphql', {method: 'POST'});</script>
+        ''')
+        fetched = []
+        bundle = '''
+            webpackChunkapp.push([]);
+            api.patch(`/api/organizations/${organizationId}/members/${memberId}`, data);
+            const accessToken = sessionStorage.getItem('token');
+            mutation InviteUser { inviteUser }
+            new WebSocket('wss://events.example/ws');
+            //# sourceMappingURL=app.js.map
+        '''
+        source_map = json.dumps({'sourceRoot': 'webpack://app/', 'sources': [
+            'src/components/UserPanel.tsx', 'src/services/UserService.ts',
+            'src/models/User.ts']})
+        def fetch(url):
+            fetched.append(url)
+            if url.endswith('app.js'):
+                return {'status': 200, 'body': bundle, 'content_type': 'application/javascript'}
+            if url.endswith('app.js.map'):
+                return {'status': 200, 'body': source_map, 'content_type': 'application/json'}
+            raise AssertionError(f'fetch externo inesperado: {url}')
+
+        report = reverse_engineer(BASE, [page], fetch)
+        self.assertEqual(fetched, [BASE + 'js/app.js', BASE + 'js/app.js.map'])
+        self.assertEqual(report['external_scripts'], ['https://cdn.example/vendor.js'])
+        patch = next(e for e in report['endpoints'] if e['method'] == 'PATCH')
+        self.assertEqual(patch['url'],
+                         'http://lab.test:8080/api/organizations/{organizationId}/members/{memberId}')
+        self.assertTrue(patch['in_scope'])
+        self.assertIn('Webpack', report['frameworks'])
+        self.assertIn('organizationId', report['signals']['authorization'])
+        self.assertIn('accessToken', report['signals']['authentication'])
+        self.assertEqual(report['graphql_operations'], [{'type': 'mutation', 'name': 'InviteUser'}])
+        self.assertIn('src/services/UserService.ts', report['source_maps'][0]['sources'])
+        self.assertTrue(any(edge['operation'] == 'PATCH' for edge in report['architecture_edges']))
+
+    def test_vendor_script_is_inventoried_without_business_signal_noise(self):
+        page = parse_page(BASE, '<script src="js/vendor/library.js"></script>')
+        source = "function createElement(){}; const role='presentation'; api.post('/telemetry', {})"
+        report = reverse_engineer(BASE, [page], lambda url: {
+            'status': 200, 'body': source, 'content_type': 'application/javascript'})
+        self.assertEqual(report['scripts'][0]['provenance'], 'vendor')
+        self.assertEqual(report['endpoints'], [])
+        self.assertEqual(report['signals']['authorization'], [])
+
     def test_crawler_follows_local_links_and_preserves_queries(self):
         fetched = []
         def fetch(url):
@@ -136,6 +186,7 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertIn('--data=d=example.test', cmd)
         self.assertIn('--cookie=PHPSESSID=session', cmd)
         self.assertEqual(cmd[cmd.index('-p') + 1], 'd')
+        self.assertEqual(cmd.count('--ignore-redirects'), 1)
 
     def test_tools_keep_path_and_query(self):
         ns = load_helpers()
@@ -206,7 +257,8 @@ class WebIntelligenceTests(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_adaptive_web')
         ns.update(tempfile=tempfile, http=http, urllib=urllib, json=json, os=os,
                   discover=discover, plan_tests=plan_tests, parse_page=parse_page,
-                  form_request=form_request, scoped_url=scoped_url)
+                  form_request=form_request, scoped_url=scoped_url,
+                  reverse_engineer=reverse_engineer)
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)
         ns['active_scans']['scan']['target'] = BASE
         html = '<form method=POST action=search.php><input name=q><button name=go value=Search>Search</button></form>'
@@ -245,6 +297,7 @@ class WebIntelligenceTests(unittest.TestCase):
         ns.update(tempfile=tempfile, http=http, urllib=urllib, json=json, os=os,
                   discover=discover, plan_tests=plan_tests, parse_page=parse_page,
                   form_request=form_request, scoped_url=scoped_url,
+                  reverse_engineer=reverse_engineer,
                   candidate_sources=candidate_sources, eligible_login_forms=eligible_login_forms,
                   run_login_tests=run_login_tests, _finding=lambda *args: {})
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)

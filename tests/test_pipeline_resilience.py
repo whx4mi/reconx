@@ -11,6 +11,38 @@ import app as reconx
 
 
 class PipelineResilienceTests(unittest.TestCase):
+    def test_reports_render_reverse_engineering_map_and_escape_html(self):
+        data = {
+            'target': 'http://lab.test/app/', 'scan_id': 'map-test',
+            'results': {}, 'adaptive_report': {'reverse_engineering': {
+                'summary': {'scripts_analyzed': 2, 'source_maps': 1,
+                            'endpoints': 1, 'in_scope_endpoints': 1},
+                'frameworks': ['React<script>'],
+                'graphql_operations': [{'type': 'query', 'name': 'Viewer'}],
+                'signals': {'authorization': ['tenantId']},
+                'endpoints': [{'method': 'POST', 'url': 'http://lab.test/api?a=<x>',
+                               'kind': 'http', 'in_scope': True,
+                               'sources': ['http://lab.test/app.js']}],
+                'source_maps': [{'url': 'http://lab.test/app.js.map', 'source_count': 4,
+                                 'sources': ['src/services/User.ts']}],
+                'external_scripts': ['https://cdn.example/vendor.js'],
+                'limitations': ['Analise estatica < runtime'],
+            }}
+        }
+        markdown = reconx.build_markdown_report(data)
+        html = reconx.build_html_report(data)
+        self.assertIn('Mapa estático da aplicação', markdown)
+        self.assertIn('POST', markdown)
+        self.assertIn('app.js.map', markdown)
+        self.assertIn('query Viewer', markdown)
+        self.assertIn('tenantId', markdown)
+        self.assertIn('Mapa estatico da aplicacao', html)
+        self.assertIn('http://lab.test/api?a=&lt;x&gt;', html)
+        self.assertIn('React&lt;script&gt;', html)
+        self.assertIn('src/services/User.ts', html)
+        self.assertIn('https://cdn.example/vendor.js', html)
+        self.assertNotIn('React<script>', html)
+
     def test_dalfox_verified_poc_exit_one_is_success_but_usage_error_is_not(self):
         self.assertTrue(reconx.tool_execution_succeeded(
             'dalfox_url', 1, '[POC][V][GET][inHTML] http://lab.test/?q=x'))
@@ -62,6 +94,47 @@ class PipelineResilienceTests(unittest.TestCase):
         ffuf, _ = reconx.build_cmd('ffuf_dirs', 'http://lab.test/app/')
         self.assertIn('http://lab.test/app/FUZZ', ffuf)
 
+    def test_web_scanners_do_not_follow_redirects_and_gobuster_flag_is_current(self):
+        for tool in ('sqlmap', 'sqlmap_url', 'commix'):
+            cmd, _ = reconx.build_cmd(tool, 'http://lab.test/app/?next=https://outside.test')
+            self.assertEqual(cmd.count('--ignore-redirects'), 1, tool)
+
+        commix, _ = reconx.build_cmd('commix', 'http://lab.test/app/?d=x')
+        self.assertIn('--ignore-stdin', commix)
+        self.assertIn('--ignore-session', commix)
+        self.assertIn('--answers=follow=N,spawn=N', commix)
+
+        dalfox, _ = reconx.build_cmd('dalfox', 'http://lab.test/app/?q=x')
+        self.assertNotIn('--follow-redirects', dalfox)
+
+        headers, _ = reconx.build_cmd('curl_headers', 'http://lab.test/app/')
+        self.assertNotIn('-L', headers)
+        self.assertEqual(headers[headers.index('--max-redirs') + 1], '0')
+
+        whatweb, _ = reconx.build_cmd('whatweb', 'http://lab.test/app/')
+        self.assertIn('--max-redirects=0', whatweb)
+
+        gobuster, _ = reconx.build_cmd('gobuster_dir', 'http://lab.test/app/')
+        self.assertIn('--useragent', gobuster)
+        self.assertNotIn('--user-agent', gobuster)
+
+        for tool in ('nuclei_cves', 'nuclei_misconfig', 'nuclei_tech',
+                     'nuclei_takeover', 'nuclei_dast', 'nuclei_secrets'):
+            cmd, _ = reconx.build_cmd(tool, 'http://lab.test/app/?q=x')
+            self.assertIn('-dr', cmd, tool)
+
+    def test_out_of_scope_scanner_finding_is_not_persisted(self):
+        scan_id = f'scope-{uuid.uuid4().hex}'
+        reconx.active_scans[scan_id] = {'target': 'http://lab.test/app/'}
+        finding = reconx._finding('nuclei_misconfig', 'vuln', 'External match',
+                                  'info', 'https://outside.test/', 'redirected')
+        try:
+            count = reconx.persist_and_emit_findings(scan_id, [], [finding], 'sid')
+            self.assertEqual(count, 0)
+            self.assertEqual(reconx.db_findings(scan_id), [])
+        finally:
+            reconx.active_scans.pop(scan_id, None)
+
     def test_active_scanners_receive_only_compatible_web_targets(self):
         targets = [
             'http://lab.test/app/',
@@ -97,10 +170,32 @@ class PipelineResilienceTests(unittest.TestCase):
         raw = '''+ Platform: Linux/Unix
 + Server: Apache/2.4.66 (Ubuntu)
 + [999967] /: Web Server returns a valid response with junk HTTP methods which may cause false positives.
++ [001631] /css/: This might be interesting.
 + [750510] /phpinfo.php: Output from the phpinfo() function was found.'''
         _, findings = reconx.parse_output('nikto', raw, 'http://lab.test/')
         self.assertEqual(len(findings), 1)
         self.assertIn('phpinfo.php', findings[0]['name'])
+
+    def test_nmap_footer_is_not_a_finding(self):
+        raw = '''PORT   STATE SERVICE VERSION
+80/tcp open  http    Apache httpd 2.4.66
+Service detection performed. Please report any incorrect results.
+Nmap done: 1 IP address (1 host up) scanned in 7.19 seconds'''
+        _, findings = reconx.parse_output('nmap_quick', raw, '192.0.2.10')
+        self.assertEqual([f['name'] for f in findings],
+                         ['80/tcp open  http    Apache httpd 2.4.66'])
+
+    def test_nuclei_technology_info_becomes_asset_not_finding(self):
+        record = {
+            'template-id': 'apache-detect',
+            'info': {'name': 'Apache Detection', 'severity': 'info'},
+            'matched-at': 'http://lab.test/app/',
+            'extracted-results': ['Apache/2.4.66'],
+        }
+        assets, findings = reconx.parse_output('nuclei_tech', __import__('json').dumps(record))
+        self.assertEqual(findings, [])
+        self.assertEqual(assets[0]['type'], 'technology')
+        self.assertIn('Apache/2.4.66', assets[0]['value'])
 
     def test_nuclei_redirect_and_phpinfo_use_response_evidence(self):
         redirect = {

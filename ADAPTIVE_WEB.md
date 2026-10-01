@@ -12,6 +12,29 @@ Também reconhece requisições `fetch()` literais construídas com
 `URLSearchParams` em scripts inline, sem executar o JavaScript. Ela preserva
 os caminhos, query strings e campos duplicados.
 
+## Engenharia reversa estática
+
+A mesma etapa coleta, com limites, os `<script src>` da origem autorizada e
+analisa scripts inline, bundles JavaScript e source maps sem executar código.
+O bloco `reverse_engineering` do `adaptive_report.json` correlaciona:
+
+- scripts analisados, tamanho e SHA-256;
+- frameworks/bundlers observados;
+- métodos e endpoints REST/XHR, rotas de frontend, GraphQL, WebSocket e SSE;
+- sinais de autenticação, papéis/permissões, tenancy, identificadores e ações
+  de negócio;
+- relações `artefato → operação → endpoint`;
+- árvore de fontes revelada por source maps, sem copiar `sourcesContent`.
+
+Scripts e endpoints externos são inventariados, mas nunca buscados ou tratados
+como autorização. Endpoints mapeados não são invocados automaticamente: eles
+são sinais arquiteturais para formular hipóteses e testes posteriores. Os
+limites padrão são 24 scripts e 8 source maps, configuráveis por
+`RECONX_REVERSE_SCRIPTS` (até 100) e `RECONX_REVERSE_SOURCE_MAPS` (até 30).
+Bundles e mapas aceitam até 4 MiB por artefato por padrão; ajuste com
+`RECONX_REVERSE_MAX_BYTES` até 16 MiB. Páginas HTML continuam limitadas a
+512 KiB.
+
 URLs parametrizadas recebem testes SQLMap/Dalfox. Formulários GET/POST
 recebem testes com os nomes e valores dos campos, botão de envio e cookies
 da descoberta. Antes de cada teste o formulário é lido novamente; SQLMap
@@ -37,10 +60,10 @@ integra o JSON final do scan. Estados:
 - `cancelled`: cancelado antes da execução.
 
 Pendências explícitas incluem uploads, formulários com potencial de exclusão,
-actions fora da origem inicial e XSS com token dinâmico. A camada interpreta
-HTML e padrões simples de scripts inline; não interpreta JavaScript arbitrário,
-bundles externos ou valores calculados, nem automatiza fluxos de navegador/SPA,
-MFA, CAPTCHA, bypass lógico ou sessões autenticadas fornecidas pelo usuário.
+actions fora da origem inicial e XSS com token dinâmico. A camada não executa
+JavaScript arbitrário, módulos carregados em runtime, service workers ou estado
+de SPA; valores calculados e fluxos autenticados podem permanecer ocultos.
+Também não automatiza MFA, CAPTCHA ou bypass lógico.
 
 ## Wordlists e testes de login
 

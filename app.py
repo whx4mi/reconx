@@ -26,7 +26,8 @@ from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import tempfile
 import http.cookiejar
 import urllib.request
-from web_intelligence import discover, plan_tests, parse_page, form_request, scoped_url
+from web_intelligence import (discover, plan_tests, parse_page, form_request,
+                              scoped_url, reverse_engineer)
 from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
 import ai_pipeline
 from host_profiles import Store as HostStore, canonical_host
@@ -441,7 +442,8 @@ def inject_proxy(cmd: list, tool_key: str, proxy=None) -> list:
         # conflito. Quando há proxy, só adicionamos a flag de proxy.
         "sqlmap":       lambda c: (c + ["--proxy", proxy_url] if proxy_url else c),
         "ffuf":         lambda c: (c + ["-x", proxy_url] if proxy_url else c) + ["-H", f"User-Agent: {ua}"],
-        "gobuster":     lambda c: (c + ["--proxy", proxy_url] if proxy_url else c) + ["--user-agent", ua],
+        # Gobuster 3.8 renamed the long option to --useragent (without a dash).
+        "gobuster":     lambda c: (c + ["--proxy", proxy_url] if proxy_url else c) + ["--useragent", ua],
         "nikto":        lambda c: (c + ["-useproxy", proxy_url] if proxy_url else c) + ["-useragent", ua],
         "nuclei":       lambda c: (c + ["-proxy", proxy_url] if proxy_url else c) + ["-H", f"User-Agent: {ua}"],
         "httpx":        lambda c: (c + ["-http-proxy", proxy_url] if proxy_url else c) + ["-H", f"User-Agent: {ua}"],
@@ -633,7 +635,7 @@ TOOLS = {
     "whatweb": {
         "label": "WhatWeb", "phase": "recon", "category": "web",
         "desc": "Fingerprint de CMS e tecnologias",
-        "cmd": ["whatweb", "--color=never", "--no-errors", "{http_url}"],
+        "cmd": ["whatweb", "--color=never", "--no-errors", "--max-redirects=0", "{http_url}"],
         "input": "url", "output": "fingerprint",
         "binary": "whatweb", "tags": ["active","fingerprint"],
         "proxy_support": True,
@@ -657,7 +659,7 @@ TOOLS = {
     "curl_headers": {
         "label": "cURL Headers", "phase": "recon", "category": "web",
         "desc": "Inspeciona headers HTTP de resposta",
-        "cmd": ["curl", "-sI", "--max-time", "15", "-L", "{http_url}"],
+        "cmd": ["curl", "-sI", "--max-time", "15", "--max-redirs", "0", "{http_url}"],
         "input": "url", "output": "headers",
         "binary": "curl", "tags": ["passive","fast"],
         "proxy_support": True,
@@ -825,7 +827,7 @@ TOOLS = {
         "label": "Nuclei CVEs", "phase": "test", "category": "web_vuln",
         "desc": "CVEs críticos, altos e médios via templates",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "cve",
-                "-severity", "critical,high,medium", "-jsonl", "-silent"],
+                "-severity", "critical,high,medium", "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["active","cve"],
         "proxy_support": True,
@@ -838,7 +840,7 @@ TOOLS = {
         "label": "Nuclei Misconfig", "phase": "test", "category": "web_vuln",
         "desc": "Misconfigurations, exposições e default logins",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "misconfig,exposure,default-login",
-                "-jsonl", "-silent"],
+                "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "misconfig",
         "json": True, "binary": "nuclei", "tags": ["active","misconfig"],
         "proxy_support": True,
@@ -851,7 +853,7 @@ TOOLS = {
         "label": "Nuclei Tech", "phase": "test", "category": "web_vuln",
         "desc": "Templates por tecnologia detectada",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "tech",
-                "-jsonl", "-silent"],
+                "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "tech_vuln",
         "json": True, "binary": "nuclei", "tags": ["active","tech"],
         "proxy_support": True,
@@ -861,7 +863,7 @@ TOOLS = {
         "label": "Nuclei Takeover", "phase": "test", "category": "web_vuln",
         "desc": "Detecção de subdomain takeover (CNAMEs órfãos)",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "takeover",
-                "-jsonl", "-silent"],
+                "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "misconfig",
         "json": True, "binary": "nuclei", "tags": ["active","takeover"],
         "proxy_support": True,
@@ -873,7 +875,7 @@ TOOLS = {
     "nuclei_dast": {
         "label": "Nuclei DAST/Fuzz", "phase": "test", "category": "web_vuln",
         "desc": "Fuzzing de parâmetros (XSS/SQLi/SSTI/LFI) via templates fuzzing",
-        "cmd": ["nuclei", "-u", "{url}", "-dast", "-jsonl", "-silent"],
+        "cmd": ["nuclei", "-u", "{url}", "-dast", "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["active","dast","fuzz"],
         "proxy_support": True, "timeout": 900,
@@ -887,7 +889,7 @@ TOOLS = {
     "sqlmap": {
         "label": "SQLMap (forms)", "phase": "test", "category": "injection",
         "desc": "SQL injection em formulários da página",
-        "cmd": ["sqlmap", "-u", "{url}", "--forms", "--batch",
+        "cmd": ["sqlmap", "-u", "{url}", "--forms", "--batch", "--ignore-redirects",
                 "--level=1", "--risk=1", "--random-agent", "--no-logging"],
         "input": "url", "output": "sqli",
         "binary": "sqlmap", "tags": ["active","sqli"],
@@ -902,7 +904,7 @@ TOOLS = {
     "sqlmap_url": {
         "label": "SQLMap (URL)", "phase": "test", "category": "injection",
         "desc": "SQL injection em parâmetros GET",
-        "cmd": ["sqlmap", "-u", "{url}", "--batch",
+        "cmd": ["sqlmap", "-u", "{url}", "--batch", "--ignore-redirects",
                 "--level=1", "--risk=1", "--random-agent", "--no-logging"],
         "input": "url", "output": "sqli",
         "binary": "sqlmap", "tags": ["active","sqli"],
@@ -915,7 +917,8 @@ TOOLS = {
     "commix": {
         "label": "Commix", "phase": "test", "category": "injection",
         "desc": "Detecção de command injection",
-        "cmd": ["commix", "--url={url}", "--batch", "--level=1"],
+        "cmd": ["commix", "--url={url}", "--batch", "--ignore-redirects",
+                "--ignore-stdin", "--ignore-session", "--answers=follow=N,spawn=N", "--level=1"],
         "input": "url", "output": "cmdi",
         "binary": "commix", "tags": ["active","cmdi"],
         "proxy_support": True,
@@ -930,8 +933,7 @@ TOOLS = {
     "dalfox": {
         "label": "Dalfox (host)", "phase": "test", "category": "xss",
         "desc": "Scanner XSS no host — detecta e gera PoC",
-        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence",
-                "--follow-redirects"],
+        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence"],
         "input": "url", "output": "xss",
         "binary": "dalfox", "tags": ["active","xss"],
         "proxy_support": True,
@@ -1087,7 +1089,7 @@ TOOLS = {
         "label": "Nuclei Secrets/Tokens", "phase": "recon", "category": "osint",
         "desc": "Detecta API keys, tokens e credenciais expostas em respostas HTTP e JS",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "exposure,token,secret,api",
-                "-severity", "critical,high,medium", "-jsonl", "-silent"],
+                "-severity", "critical,high,medium", "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["passive","secrets"],
         "proxy_support": True,
@@ -1603,7 +1605,7 @@ def build_cmd(tool_key, raw_target, proxy=None, request_context=None):
             else:
                 cmd += ['-p', ','.join(dict.fromkeys(params))]
         if tool_key == 'sqlmap_url':
-            cmd += ['--ignore-redirects', '--timeout=10', '--retries=1']
+            cmd += ['--timeout=10', '--retries=1']
             if request_context.get('tokens'):
                 cmd += ['--csrf-token', request_context['tokens'][0],
                         '--csrf-url', request_context['page']]
@@ -1915,7 +1917,8 @@ _TOOL_NOISE = {
         r'^Not shown:|^PORT\s+STATE|'
         r'^\|[_\s]|'                               # linhas NSE: |_http-server-header
         r'^MAC Address:|^Service Info:|^OS (?:details|CPE):|'
-        r'^Network Distance|^TRACEROUTE|^Aggressive OS',
+        r'^Network Distance|^TRACEROUTE|^Aggressive OS|'
+        r'^Service detection performed|^Nmap done:',
         re.I
     ),
 }
@@ -1947,7 +1950,7 @@ def _text_findings(tool_key, otype, lines, target=''):
         # that the result itself may cause false positives.
         if otype == 'nikto':
             if not re.match(r'^\+\s+\[(?:\d{6}|CVE-|OSVDB-)', l, re.I): continue
-            if re.search(r'may cause false positives', l, re.I): continue
+            if re.search(r'may cause false positives|This might be interesting', l, re.I): continue
         if   _HI_RE.search(l):  sev = 'high'
         elif _MED_RE.search(l): sev = 'medium'
         elif _LOW_RE.search(l): sev = 'low'
@@ -2337,7 +2340,15 @@ def parse_output(tool_key, raw, default_target=''):
                 url = req.get('endpoint') or o.get('endpoint') or o.get('url') or ''
                 if url: assets.append({'value': url, 'label': url[:80], 'type': 'url'})
             elif otype in ('cves','misconfig','tech_vuln','xss','sqli'):
-                findings.append(_nuclei_json_finding(tool_key, otype, o))
+                finding = _nuclei_json_finding(tool_key, otype, o)
+                if tool_key == 'nuclei_tech' and finding['severity'] == 'info':
+                    # Technology templates are fingerprints, not vulnerabilities.
+                    values = o.get('extracted-results') or o.get('extracted_results') or []
+                    detail = ', '.join(map(str, values)) if isinstance(values, list) else str(values)
+                    value = finding['name'] + (f': {detail}' if detail else '')
+                    assets.append({'value': value, 'label': value[:80], 'type': 'technology'})
+                else:
+                    findings.append(finding)
         for finding in findings:
             if not finding.get('target'):
                 finding['target'] = default_target
@@ -2381,11 +2392,27 @@ def parse_output(tool_key, raw, default_target=''):
             finding['target'] = default_target
     return _dedup_assets(assets), findings
 
+def _finding_within_scope(initial_target, finding):
+    """Reject scanner matches attributed to a different origin."""
+    if not initial_target:
+        return True
+    target = str(finding.get('target') or '').strip()
+    if not target:
+        return True
+    if to_url(target):
+        return scoped_url(initial_target, target) is not None
+    target_host = to_host(target)
+    initial_host = to_host(initial_target)
+    return not target_host or target_host.lower() == (initial_host or '').lower()
+
+
 def persist_and_emit_findings(scan_id, assets, findings, sid):
     for a in assets:
         db_add_asset(scan_id, a['type'], a['value'])
     new_count = 0
     for f in findings:
+        if not _finding_within_scope(active_scans.get(scan_id, {}).get('target', ''), f):
+            continue
         is_new, fid = db_add_finding(scan_id, f['tool'], f['ftype'], f['name'],
                                      f['severity'], f['target'], f['evidence'],
                                      f.get('confidence', 'possible'))
@@ -2634,13 +2661,18 @@ def run_adaptive_web(scan_id, targets, sid):
     scan = active_scans.get(scan_id, {})
     initial = to_url(scan.get('target', '')) or to_http_url(scan.get('target', ''))
     report = {'pages': [], 'forms': [], 'tasks': [], 'pending': [], 'errors': [],
-              'limits': {'pages': 12, 'depth': 2, 'jobs': 12}, 'truncated': False,
-              'limitations': ['JavaScript não é executado; somente fetch literal e URLSearchParams simples são extraídos',
+              'limits': {'pages': 12, 'depth': 2, 'jobs': 12, 'scripts': 24,
+                         'source_maps': 8, 'artifact_bytes': 4194304},
+              'truncated': False,
+              'limitations': ['JavaScript não é executado; análise estática não observa estado de runtime da SPA',
                               'Login por listas exige configuração e critério de sucesso; uploads e fluxos destrutivos exigem revisão',
                               'completed indica processo concluído, não ausência de vulnerabilidades']}
     for key, variable, ceiling in (('pages', 'RECONX_ADAPTIVE_PAGES', 200),
                                     ('depth', 'RECONX_ADAPTIVE_DEPTH', 5),
-                                    ('jobs', 'RECONX_ADAPTIVE_JOBS', 100)):
+                                    ('jobs', 'RECONX_ADAPTIVE_JOBS', 100),
+                                    ('scripts', 'RECONX_REVERSE_SCRIPTS', 100),
+                                    ('source_maps', 'RECONX_REVERSE_SOURCE_MAPS', 30),
+                                    ('artifact_bytes', 'RECONX_REVERSE_MAX_BYTES', 16777216)):
         try:
             report['limits'][key] = max(1, min(ceiling, int(os.environ.get(variable, report['limits'][key]))))
         except ValueError:
@@ -2662,8 +2694,10 @@ def run_adaptive_web(scan_id, targets, sid):
             if not scoped_url(initial, url):
                 raise ValueError('URL fora do escopo')
             proxy = dict(active_proxy)
+            artifact = urlsplit(url).path.lower().endswith(('.js', '.mjs', '.js.map', '.map'))
+            max_bytes = report['limits']['artifact_bytes'] if artifact else 524288
             cmd = ['curl', '--silent', '--show-error', '--max-time', '12',
-                   '--max-filesize', '524288', '--dump-header', str(temp / 'headers'),
+                   '--max-filesize', str(max_bytes), '--dump-header', str(temp / 'headers'),
                    '--output', str(temp / 'body'), '--cookie', str(cookie_file),
                    '--cookie-jar', str(cookie_file), url]
             if request_data is not None:
@@ -2701,6 +2735,15 @@ def run_adaptive_web(scan_id, targets, sid):
                                                                max_pages=report['limits']['pages'],
                                                                max_depth=report['limits']['depth'],
                                                                cancelled=lambda: scan.get('cancelled', False))
+        report['reverse_engineering'] = reverse_engineer(
+            initial, pages, fetch, max_scripts=report['limits']['scripts'],
+            max_source_maps=report['limits']['source_maps'],
+            cancelled=lambda: scan.get('cancelled', False))
+        reverse_summary = report['reverse_engineering']['summary']
+        log('[Reverse] '
+            f"{reverse_summary['scripts_analyzed']} scripts, "
+            f"{reverse_summary['source_maps']} source maps, "
+            f"{reverse_summary['endpoints']} endpoints mapeados")
         login_config = scan.get('login_testing', {'enabled': False})
         if login_config.get('enabled') and not scan.get('cancelled'):
             log(f"[Login] Preparando wordlists: {login_config['mode']}")
@@ -3470,6 +3513,12 @@ def api_export(scan_id):
 def api_scan_summary(scan_id):
     return jsonify(db_summary(scan_id))
 
+def _reverse_report(d):
+    adaptive = d.get('adaptive_report') or {}
+    report = adaptive.get('reverse_engineering') or {}
+    return report if isinstance(report, dict) else {}
+
+
 def build_markdown_report(d: dict, findings=None, summary=None) -> str:
     """Gera um relatório Markdown a partir do JSON salvo de um scan."""
     lines = []
@@ -3496,6 +3545,45 @@ def build_markdown_report(d: dict, findings=None, summary=None) -> str:
         for fnd in findings:
             tgt = f"  -  {fnd['target']}" if fnd.get('target') else ""
             lines.append(f"- **[{fnd['severity'].upper()}]** {fnd['name']} - `{fnd['tool']}`{tgt}")
+        lines.append("")
+    reverse = _reverse_report(d)
+    if reverse:
+        reverse_summary = reverse.get('summary', {})
+        lines.append("## Mapa estático da aplicação")
+        lines.append("")
+        lines.append(
+            f"- Scripts analisados: {reverse_summary.get('scripts_analyzed', 0)}; "
+            f"source maps: {reverse_summary.get('source_maps', 0)}; "
+            f"endpoints: {reverse_summary.get('endpoints', 0)} "
+            f"({reverse_summary.get('in_scope_endpoints', 0)} no escopo).")
+        frameworks = reverse.get('frameworks', [])
+        if frameworks:
+            lines.append(f"- Frameworks/bundlers observados: {', '.join(map(str, frameworks))}.")
+        operations = reverse.get('graphql_operations', [])
+        if operations:
+            lines.append("- Operações GraphQL: " + ', '.join(
+                f"{item.get('type', '?')} {item.get('name', '?')}" for item in operations) + ".")
+        for category, values in reverse.get('signals', {}).items():
+            if values:
+                lines.append(f"- Sinais `{category}`: {', '.join(map(str, values))}.")
+        for endpoint in reverse.get('endpoints', []):
+            scope = 'no escopo' if endpoint.get('in_scope') else 'referência externa'
+            sources = ', '.join(map(str, endpoint.get('sources', []))) or 'origem não registrada'
+            lines.append(
+                f"- `{endpoint.get('method', '?')}` `{endpoint.get('url', '?')}` "
+                f"({endpoint.get('kind', 'http')}; {scope}) ← `{sources}`")
+        for source_map in reverse.get('source_maps', []):
+            sources = ', '.join(map(str, source_map.get('sources', []))) or 'nenhuma fonte declarada'
+            lines.append(
+                f"- Source map `{source_map.get('url', '?')}`: "
+                f"{source_map.get('source_count', 0)} fontes declaradas — `{sources}`.")
+        for external in reverse.get('external_scripts', []):
+            lines.append(f"- Script externo inventariado, não acessado: `{external}`.")
+        limitations = reverse.get('limitations', [])
+        if limitations:
+            lines.append("")
+            lines.append("### Limitações da engenharia reversa")
+            lines.extend(f"- {item}" for item in limitations)
         lines.append("")
     lines.append("## Resultados por estágio")
     for stage_id, tools in d.get('results', {}).items():
@@ -3613,6 +3701,57 @@ def build_html_report(d: dict, findings=None, summary=None) -> str:
     tbl = ('<table><thead><tr><th>Severidade</th><th>Finding</th><th>Confidence</th><th>Alvo</th></tr></thead>'
            f'<tbody>{rows_by_sev}</tbody></table>') if rows_by_sev else '<p style="color:#4e5a7a">Nenhum finding registrado.</p>'
 
+    reverse = _reverse_report(d)
+    reverse_section = ''
+    if reverse:
+        reverse_summary = reverse.get('summary', {})
+        endpoint_rows = ''.join(
+            '<tr>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("method", "?")))}</td>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("url", "?")))}</td>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("kind", "http")))}</td>'
+            f'<td style="padding:8px 10px">{"sim" if item.get("in_scope") else "nao"}</td>'
+            f'<td style="padding:8px 10px">{esc(", ".join(map(str, item.get("sources", []))))}</td>'
+            '</tr>' for item in reverse.get('endpoints', []))
+        endpoint_table = (
+            '<table><thead><tr><th>Operacao</th><th>Endpoint</th><th>Canal</th>'
+            '<th>No escopo</th><th>Origem</th></tr></thead>'
+            f'<tbody>{endpoint_rows}</tbody></table>') if endpoint_rows else (
+                '<p style="color:#4e5a7a">Nenhum endpoint extraido estaticamente.</p>')
+        frameworks = ', '.join(map(str, reverse.get('frameworks', []))) or 'nenhum identificado'
+        source_maps = ''.join(
+            f'<li>{esc(str(item.get("url", "?")))}: '
+            f'{int(item.get("source_count", 0))} fontes declaradas'
+            f'<br><span style="color:#6272a4">{esc(", ".join(map(str, item.get("sources", []))))}</span></li>'
+            for item in reverse.get('source_maps', []))
+        graphql = ', '.join(
+            f'{item.get("type", "?")} {item.get("name", "?")}'
+            for item in reverse.get('graphql_operations', []))
+        signals = ''.join(
+            f'<li><b>{esc(str(category))}</b>: {esc(", ".join(map(str, values)))}</li>'
+            for category, values in reverse.get('signals', {}).items() if values)
+        external = ''.join(
+            f'<li>{esc(str(item))} <span style="color:#6272a4">(nao acessado)</span></li>'
+            for item in reverse.get('external_scripts', []))
+        limitations = ''.join(
+            f'<li>{esc(str(item))}</li>' for item in reverse.get('limitations', []))
+        reverse_section = f'''
+<h2>Mapa estatico da aplicacao</h2>
+<div style="background:#0e1118;border:1px solid #1e2535;border-radius:7px;padding:14px;margin-bottom:12px">
+  Scripts analisados: <b>{int(reverse_summary.get('scripts_analyzed', 0))}</b> &nbsp;|&nbsp;
+  Source maps: <b>{int(reverse_summary.get('source_maps', 0))}</b> &nbsp;|&nbsp;
+  Endpoints: <b>{int(reverse_summary.get('endpoints', 0))}</b> &nbsp;|&nbsp;
+  No escopo: <b>{int(reverse_summary.get('in_scope_endpoints', 0))}</b><br>
+  <span style="color:#6272a4">Frameworks/bundlers: {esc(frameworks)}</span>
+</div>
+{endpoint_table}
+{f'<h3>Operacoes GraphQL</h3><p>{esc(graphql)}</p>' if graphql else ''}
+{f'<h3>Sinais de arquitetura</h3><ul>{signals}</ul>' if signals else ''}
+{f'<h3>Source maps</h3><ul>{source_maps}</ul>' if source_maps else ''}
+{f'<h3>Scripts externos inventariados</h3><ul>{external}</ul>' if external else ''}
+{f'<h3>Limitacoes</h3><ul>{limitations}</ul>' if limitations else ''}
+'''
+
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -3649,6 +3788,7 @@ tr:hover td{{background:#0e1118}}
 </div>
 <h2>Findings por severidade</h2>
 {tbl}
+{reverse_section}
 <h2>Agrupamento por vetor de ataque</h2>
 {vector_sections or '<p style="color:#4e5a7a">Nenhum dado.</p>'}
 <h2>Checklist de testes manuais relevantes</h2>
