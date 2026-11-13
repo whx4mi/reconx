@@ -110,6 +110,17 @@ def db_init():
         c.execute("PRAGMA journal_mode=WAL;")
         c.executescript(DB_SCHEMA)
 
+def db_reconcile_orphaned_scans():
+    """Fail scans that cannot still have a worker after this process started."""
+    finished_at = datetime.now().isoformat()
+    with _db_lock, _db() as c:
+        cursor = c.execute(
+            "UPDATE scans SET status='failed', finished_at=? "
+            "WHERE status='running' AND finished_at IS NULL",
+            (finished_at,),
+        )
+        return cursor.rowcount
+
 def db_create_scan(scan_id, target, pipeline, proxy):
     with _db_lock, _db() as c:
         c.execute("""INSERT OR REPLACE INTO scans
@@ -251,6 +262,7 @@ def db_summary(scan_id):
 
 try:
     db_init()
+    db_reconcile_orphaned_scans()
 except sqlite3.OperationalError as exc:
     if 'readonly database' in str(exc).lower():
         raise SystemExit('Banco de resultados sem permissão de escrita. Inicie com: sudo /usr/local/bin/reconx') from None

@@ -17,6 +17,33 @@ class PipelineResilienceTests(unittest.TestCase):
         with self.assertRaises(sqlite3.ProgrammingError):
             connection.execute('SELECT 1')
 
+    def test_startup_reconciles_orphaned_running_scans(self):
+        orphan = f'orphan-{uuid.uuid4().hex}'
+        completed = f'done-{uuid.uuid4().hex}'
+        try:
+            reconx.db_reconcile_orphaned_scans()
+            reconx.db_create_scan(orphan, 'http://lab.test/app/', 'test', 'none')
+            reconx.db_create_scan(completed, 'http://lab.test/app/', 'test', 'none')
+            reconx.db_finish_scan(completed, 'done')
+
+            self.assertEqual(reconx.db_reconcile_orphaned_scans(), 1)
+            with reconx._db() as connection:
+                rows = {
+                    row['scan_id']: dict(row)
+                    for row in connection.execute(
+                        'SELECT scan_id,status,finished_at FROM scans '
+                        'WHERE scan_id IN (?,?)', (orphan, completed))
+                }
+            self.assertEqual(rows[orphan]['status'], 'failed')
+            self.assertIsNotNone(rows[orphan]['finished_at'])
+            self.assertEqual(rows[completed]['status'], 'done')
+        finally:
+            with reconx._db() as connection:
+                connection.execute(
+                    'DELETE FROM scans WHERE scan_id IN (?,?)',
+                    (orphan, completed),
+                )
+
     def test_runtime_temp_directory_lives_beside_results(self):
         self.assertEqual(reconx.RUNTIME_TMP_DIR, reconx.RESULTS_DIR / '.tmp')
         self.assertEqual(tempfile.gettempdir(), str(reconx.RUNTIME_TMP_DIR))
