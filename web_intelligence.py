@@ -3,18 +3,23 @@ from collections import deque
 from html.parser import HTMLParser
 import hashlib
 import json
+import posixpath
 import re
 import subprocess
-from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode, unquote
 
 TOKEN = re.compile(r'csrf|xsrf|token|nonce', re.I)
 MUTATION = re.compile(r'delete|remove|logout|signout|reset|destroy|purchase|checkout', re.I)
 STATIC = re.compile(r'\.(?:png|jpg|jpeg|gif|svg|ico|css|js|pdf|zip|mp4|woff2?)(?:$)', re.I)
+DOCUMENT = re.compile(r'\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|xml|json)(?:$)', re.I)
+ARCHIVE = re.compile(r'\.(?:zip|tar|tgz|gz|bz2|7z|rar)(?:$)', re.I)
 
 
 def scoped_url(base, value):
     """Allow only HTTP(S) URLs with the initial origin, including its port."""
     try:
+        if re.search(r'[\x00-\x20<>"|\\^`]', str(value or '')):
+            return None
         url = urlsplit(urljoin(base, value))
         origin = urlsplit(base)
         def key(p):
@@ -26,11 +31,70 @@ def scoped_url(base, value):
         return None
 
 
+def normalize_allowed_paths(values=()):
+    """Validate operator-configured same-origin path prefixes."""
+    if isinstance(values, str):
+        values = values.split(',')
+    result = []
+    for value in values or ():
+        value = str(value).strip()
+        if not value:
+            continue
+        parsed = urlsplit(value)
+        if (not value.startswith('/') or parsed.scheme or parsed.netloc or
+                parsed.query or parsed.fragment or re.search(r'[\x00-\x20<>"|\\^`]', value)):
+            raise ValueError('Allowlist de paths aceita somente prefixos absolutos, como /api/')
+        normalized = _normalized_path(parsed.path)
+        prefix = normalized.rstrip('/') + '/' if normalized != '/' else '/'
+        if prefix not in result:
+            result.append(prefix)
+    return tuple(result)
+
+
+def _normalized_path(path):
+    decoded = unquote(str(path or '/')).replace('\\', '/')
+    normalized = posixpath.normpath('/' + decoded.lstrip('/'))
+    return normalized if normalized.startswith('/') else '/' + normalized
+
+
+def application_base_path(base):
+    """Return the default application boundary represented by the seed URL."""
+    path = _normalized_path(urlsplit(base).path)
+    if path == '/':
+        return '/'
+    leaf = path.rsplit('/', 1)[-1]
+    if str(urlsplit(base).path).endswith('/') or '.' not in leaf:
+        return path.rstrip('/') + '/'
+    parent = path.rsplit('/', 1)[0] or '/'
+    return parent.rstrip('/') + '/' if parent != '/' else '/'
+
+
+def application_url(base, value, allowed_paths=()):
+    """Keep a URL inside the seed application path or explicit path allowlist."""
+    candidate = scoped_url(base, value)
+    if not candidate:
+        return None
+    path = _normalized_path(urlsplit(candidate).path)
+    prefixes = (application_base_path(base), *normalize_allowed_paths(allowed_paths))
+    for prefix in prefixes:
+        root = prefix.rstrip('/') or '/'
+        if root == '/' or path == root or path.startswith(root + '/'):
+            return candidate
+    return None
+
+
+def classify_url_scope(base, value, allowed_paths=()):
+    if application_url(base, value, allowed_paths):
+        return 'in_scope'
+    return 'same_origin_outside_base' if scoped_url(base, value) else 'external_or_invalid'
+
+
 class PageParser(HTMLParser):
     def __init__(self, url):
         super().__init__(convert_charrefs=True)
-        self.url, self.links, self.forms = url, [], []
+        self.url, self.base_url, self.links, self.forms = url, url, [], []
         self.script_sources = []
+        self.references = []
         self.current = None
         self.textarea = None
         self.select = None
@@ -40,23 +104,77 @@ class PageParser(HTMLParser):
         self.script_requests = []
         self.ignore_text = 0
 
+    def _reference(self, tag, attribute, value, kind, navigable=False):
+        value = str(value or '').strip()
+        if not value:
+            return None
+        try:
+            resolved = urljoin(self.base_url, value)
+            parsed = urlsplit(resolved)
+            valid = (parsed.scheme.lower() in ('http', 'https') and
+                     not re.search(r'[\x00-\x20<>"|\\^`]', resolved))
+        except (TypeError, ValueError):
+            resolved, valid = value, False
+        self.references.append({
+            'url': resolved, 'raw': value, 'tag': tag, 'attribute': attribute,
+            'kind': kind, 'navigable': navigable, 'valid': valid,
+        })
+        return resolved if valid else None
+
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if tag == 'base' and a.get('href'):
+            self.base_url = urljoin(self.url, a['href'])
         if tag in ('script', 'style', 'textarea'):
             self.ignore_text += 1
         if tag == 'script':
             if a.get('src'):
-                self.script_sources.append(urljoin(self.url, a['src']))
+                target = self._reference(tag, 'src', a['src'], 'script')
+                if target:
+                    self.script_sources.append(target)
             else:
                 self.current_script = ''
         if tag == 'a' and a.get('href'):
-            self.links.append(urljoin(self.url, a['href']))
+            target = self._reference(tag, 'href', a['href'], 'navigation', True)
+            if target:
+                self.links.append(target)
+        if tag in ('iframe', 'frame') and a.get('src'):
+            target = self._reference(tag, 'src', a['src'], 'frame', True)
+            if target:
+                self.links.append(target)
+        if tag == 'link' and a.get('href'):
+            relations = {item.lower() for item in a.get('rel', '').split()}
+            kind = ('manifest' if 'manifest' in relations else
+                    'stylesheet' if 'stylesheet' in relations else
+                    'icon' if relations & {'icon', 'apple-touch-icon', 'mask-icon'} else
+                    'preload' if relations & {'preload', 'prefetch', 'modulepreload'} else 'link')
+            self._reference(tag, 'href', a['href'], kind)
+        for resource_tag, attribute, kind in (
+                ('img', 'src', 'image'), ('source', 'src', 'media'),
+                ('video', 'src', 'media'), ('audio', 'src', 'media'),
+                ('object', 'data', 'object'), ('embed', 'src', 'embed')):
+            if tag == resource_tag and a.get(attribute):
+                self._reference(tag, attribute, a[attribute], kind)
+        if tag in ('img', 'source') and a.get('srcset'):
+            for candidate in a['srcset'].split(','):
+                value = candidate.strip().split()[0] if candidate.strip() else ''
+                if value:
+                    self._reference(tag, 'srcset', value,
+                                    'image' if tag == 'img' else 'media')
+        if tag == 'meta' and a.get('http-equiv', '').lower() == 'refresh':
+            match = re.search(r'\burl\s*=\s*(["\']?)([^"\';]+)\1', a.get('content', ''), re.I)
+            if match:
+                target = self._reference(tag, 'content', match.group(2).strip(),
+                                         'meta_refresh', True)
+                if target:
+                    self.links.append(target)
         if tag == 'form':
-            self.current = {'page': self.url, 'action': urljoin(self.url, a.get('action') or self.url),
+            self.current = {'page': self.url, 'action': urljoin(self.base_url, a.get('action') or self.url),
                             'method': a.get('method', 'GET').upper(),
                             'enctype': a.get('enctype', 'application/x-www-form-urlencoded').lower(),
                             'fields': [], 'login': False, 'upload': False}
             self.forms.append(self.current)
+            self._reference(tag, 'action', self.current['action'], 'form')
         if self.current is None or 'disabled' in a:
             return
         if tag in ('input', 'button') and a.get('name'):
@@ -157,6 +275,55 @@ def parse_page(url, html):
     return parser
 
 
+def inventory_resources(initial_url, pages, allowed_paths=()):
+    """Deduplicate HTML references without fetching or promoting them to targets."""
+    inventory = {}
+    for page in pages:
+        for reference in page.references:
+            url = reference['url']
+            try:
+                parsed = urlsplit(url)
+                path, scheme = parsed.path, parsed.scheme.lower()
+            except ValueError:
+                path, scheme = '', ''
+            kind = ('document' if DOCUMENT.search(path) else
+                    'archive' if ARCHIVE.search(path) else reference['kind'])
+            scoped = application_url(initial_url, url, allowed_paths) if reference.get('valid') else None
+            scope = ('invalid' if not reference.get('valid') else
+                     'in_scope' if scoped else
+                     'same_origin_outside_base' if scoped_url(initial_url, url) else
+                     'external' if scheme in ('http', 'https') else 'non_http')
+            key = (url, kind)
+            item = inventory.setdefault(key, {
+                'url': url, 'kind': kind, 'scope': scope,
+                'tags': [], 'attributes': [], 'sources': [],
+                'navigable': False, 'valid': bool(reference.get('valid')),
+            })
+            item['tags'].append(reference['tag'])
+            item['attributes'].append(reference['attribute'])
+            item['sources'].append(page.url)
+            item['navigable'] |= reference['navigable']
+    for item in inventory.values():
+        for field in ('tags', 'attributes', 'sources'):
+            item[field] = list(dict.fromkeys(item[field]))
+    return list(inventory.values())
+
+
+def _is_html_response(response):
+    """Accept declared HTML or conservatively sniff HTML when MIME is absent."""
+    content_type = str(response.get('content_type') or '').lower()
+    if 'html' in content_type or 'xhtml' in content_type:
+        return True, False
+    if content_type and not any(kind in content_type for kind in (
+            'text/plain', 'application/octet-stream', 'binary/octet-stream')):
+        return False, False
+    body = str(response.get('body') or '')[:8192].lstrip('\ufeff\x00\t\r\n ')
+    structural = sum(token in body.lower() for token in (
+        '<html', '<head', '<body', '<title', '<form', '<script'))
+    sniffed = body.lower().startswith('<!doctype html') or structural >= 2
+    return sniffed, sniffed
+
+
 _JS_HTTP_CALL = re.compile(
     r'(?P<client>fetch|(?:axios|api|client|http|this\.http)\s*\.\s*'
     r'(?P<verb>get|post|put|patch|delete|head|options))\s*\(\s*'
@@ -212,7 +379,8 @@ def _script_provenance(source_url):
     return 'application'
 
 
-def _jsluice_endpoints(initial_url, source_url, resolution_url, source, binary):
+def _jsluice_endpoints(initial_url, source_url, resolution_url, source, binary,
+                       allowed_paths=()):
     """Analyze already-fetched JavaScript without allowing an independent fetch."""
     if not binary:
         return [], None
@@ -240,11 +408,12 @@ def _jsluice_endpoints(initial_url, source_url, resolution_url, source, binary):
         if not value or method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE',
                                        'HEAD', 'OPTIONS'):
             continue
+        scope = classify_url_scope(initial_url, value, allowed_paths)
         endpoints.append({
             'method': method,
             'url': value,
             'kind': f"jsluice:{str(item.get('type') or 'ast')}",
-            'in_scope': scoped_url(initial_url, value) is not None,
+            'in_scope': scope == 'in_scope', 'scope': scope,
             'source': source_url,
             'query_parameters': list(dict.fromkeys(
                 str(name) for name in item.get('queryParams', []) if name))[:100],
@@ -257,7 +426,7 @@ def _jsluice_endpoints(initial_url, source_url, resolution_url, source, binary):
 
 
 def analyze_javascript(initial_url, source_url, source, jsluice_binary=None,
-                       resolution_url=None):
+                       resolution_url=None, allowed_paths=()):
     """Extract architecture signals from JavaScript as data, never as findings."""
     endpoints = []
     resolution_url = resolution_url or source_url
@@ -268,9 +437,10 @@ def analyze_javascript(initial_url, source_url, source, jsluice_binary=None,
         if not value or value.startswith(('data:', 'javascript:', '#')):
             return
         resolved = urljoin(resolution_url, value) if not value.startswith(('ws://', 'wss://')) else value
+        scope = classify_url_scope(initial_url, resolved, allowed_paths)
         endpoints.append({
             'method': method.upper(), 'url': resolved, 'kind': kind,
-            'in_scope': scoped_url(initial_url, resolved) is not None,
+            'in_scope': scope == 'in_scope', 'scope': scope,
             'source': source_url, 'detectors': ['builtin'],
         })
 
@@ -304,7 +474,8 @@ def analyze_javascript(initial_url, source_url, source, jsluice_binary=None,
     supplemental, warning = ([], None)
     if provenance != 'vendor':
         supplemental, warning = _jsluice_endpoints(
-            initial_url, source_url, resolution_url, source, jsluice_binary)
+            initial_url, source_url, resolution_url, source, jsluice_binary,
+            allowed_paths)
     for candidate in supplemental:
         existing = next((item for item in endpoints
                          if item['method'] == candidate['method']
@@ -329,7 +500,7 @@ def analyze_javascript(initial_url, source_url, source, jsluice_binary=None,
 
 
 def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=8,
-                       cancelled=lambda: False, jsluice_binary=None):
+                       cancelled=lambda: False, jsluice_binary=None, allowed_paths=()):
     """Build a bounded static model from HTML, JS bundles and source maps."""
     report = {
         'scripts': [], 'external_scripts': [], 'source_maps': [], 'endpoints': [],
@@ -357,9 +528,9 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
         for index, source in enumerate(page.scripts, 1):
             analyses.append(analyze_javascript(
                 initial_url, f'{page.url}#inline-{index}', source, jsluice_binary,
-                resolution_url=page.url))
+                resolution_url=page.url, allowed_paths=allowed_paths))
         for url in page.script_sources:
-            if scoped_url(initial_url, url):
+            if application_url(initial_url, url, allowed_paths):
                 script_urls.append(url)
                 script_bases.setdefault(url, page.url)
             else:
@@ -387,13 +558,14 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
                                       'sha256': hashlib.sha256(source.encode()).hexdigest()})
             analyses.append(analyze_javascript(
                 initial_url, url, source, jsluice_binary,
-                resolution_url=script_bases.get(url, initial_url)))
+                resolution_url=script_bases.get(url, initial_url),
+                allowed_paths=allowed_paths))
         except (ValueError, OSError, RuntimeError) as exc:
             report['errors'].append({'url': url, 'reason': str(exc)})
 
     map_urls = list(dict.fromkeys(url for analysis in analyses
                                   for url in analysis['source_maps']
-                                  if scoped_url(initial_url, url)))
+                                  if application_url(initial_url, url, allowed_paths)))
     if len(map_urls) > max_source_maps:
         report['truncated'] = True
         map_urls = map_urls[:max_source_maps]
@@ -468,12 +640,14 @@ def reverse_engineer(initial_url, pages, fetch, max_scripts=24, max_source_maps=
     return report
 
 
-def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=lambda: False):
-    initial_url = scoped_url(initial_url, initial_url)
+def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=lambda: False,
+             allowed_paths=()):
+    initial_url = application_url(initial_url, initial_url, allowed_paths)
     if not initial_url:
         raise ValueError('Alvo HTTP(S) inválido')
     queue = deque([(initial_url, 0)])
-    queue.extend((u, 0) for s in seeds if (u := scoped_url(initial_url, s)))
+    queue.extend((u, 0) for s in seeds
+                 if (u := application_url(initial_url, s, allowed_paths)))
     seen, pages, errors = set(), [], []
     while queue and len(seen) < max_pages and not cancelled():
         url, depth = queue.popleft()
@@ -484,7 +658,7 @@ def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=
             response = fetch(url)
             status = response['status']
             if 300 <= status < 400:
-                redirect = scoped_url(url, response.get('location', ''))
+                redirect = application_url(initial_url, response.get('location', ''), allowed_paths)
                 if redirect and depth < max_depth:
                     queue.append((redirect, depth + 1))
                 else:
@@ -493,14 +667,17 @@ def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=
             if status != 200:
                 errors.append({'url': url, 'reason': f'HTTP {status}; conteúdo não analisado'})
                 continue
-            if 'html' not in response.get('content_type', '').lower():
+            is_html, inferred = _is_html_response(response)
+            if not is_html:
                 errors.append({'url': url, 'reason': 'Resposta não HTML'})
                 continue
             page = parse_page(url, response['body'])
+            page.content_type = response.get('content_type', '')
+            page.content_type_inferred = inferred
             pages.append(page)
             if depth < max_depth:
                 for link in page.links:
-                    target = scoped_url(initial_url, link)
+                    target = application_url(initial_url, link, allowed_paths)
                     if target:
                         queue.append((target, depth + 1))
         except (ValueError, OSError, RuntimeError) as exc:
@@ -508,7 +685,7 @@ def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=
     return pages, errors, bool(queue)
 
 
-def plan_tests(initial_url, pages, max_jobs=12):
+def plan_tests(initial_url, pages, max_jobs=12, allowed_paths=()):
     jobs, pending, seen = [], [], set()
     def add(tool, url, reason, form=None):
         key = (tool, url, form['method'] if form else 'GET',
@@ -523,7 +700,7 @@ def plan_tests(initial_url, pages, max_jobs=12):
             for tool in ('sqlmap_url', 'dalfox_url'):
                 add(tool, page.url, 'Parâmetros na URL')
         for form in [*page.forms, *page.script_requests]:
-            action = scoped_url(initial_url, form['action'])
+            action = application_url(initial_url, form['action'], allowed_paths)
             if not action:
                 pending.append({'url': form['page'], 'reason': 'Action do formulário fora do escopo'})
                 continue

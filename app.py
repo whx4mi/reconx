@@ -28,7 +28,9 @@ import http.cookiejar
 import urllib.request
 from contextlib import contextmanager
 from web_intelligence import (discover, plan_tests, parse_page, form_request,
-                              scoped_url, reverse_engineer)
+                              scoped_url, reverse_engineer, inventory_resources,
+                              application_url, application_base_path,
+                              normalize_allowed_paths)
 from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
 import ai_pipeline
 from host_profiles import Store as HostStore, canonical_host
@@ -1125,15 +1127,16 @@ TOOLS = {
     # ── RECON — CLOUD / SHODAN (v6) ───────────────────────────────────────────
     "uncover": {
         "label": "Uncover (Shodan/Censys)", "phase": "recon", "category": "osint",
-        "desc": "Agrega Shodan, Censys, Fofa e Hunter.io — descobre ativos expostos com contexto",
-        "cmd": ["uncover", "-q", "{domain}", "-silent", "-json"],
+        "desc": "Consulta passiva Shodan por domínio e retorna hosts/portas candidatos",
+        "cmd": ["uncover", "-e", "shodan", "-q", "domain:{domain}",
+                "-f", "ip:port", "-l", "100", "-silent"],
         "input": "domain", "output": "live_hosts",
-        "json": True, "binary": "uncover", "tags": ["passive","osint"],
+        "binary": "uncover", "tags": ["passive","osint"],
         "proxy_support": False,
         "manual_followup": [
             "Ativos Shodan: infra legada sem patch — alta prioridade de teste",
-            "Configure API keys: ~/.config/uncover/provider-config.yaml",
-            "Busca avançada: uncover -q 'ssl:example.com' ou 'http.title:\"Login\"'",
+            "Configure a chave fora do ReconX em ~/.config/uncover/provider-config.yaml (modo 0600)",
+            "Resultados Shodan são candidatos externos e exigem aprovação de escopo antes de testes ativos",
         ],
     },
     "cloud_enum": {
@@ -1694,11 +1697,20 @@ def extract_targets(tool_key, raw_output):
 
     elif output_type == 'live_hosts':
         for line in lines:
-            m = re.match(r'(https?://[\w\.\-]+(:\d+)?)', line)
-            if m:
-                h = to_host(m.group(1))
-                if h:
-                    targets.append({"value": h, "label": m.group(1), "type": "host"})
+            candidates = []
+            try:
+                item = json.loads(line)
+                ip = str(item.get('ip') or item.get('ip_str') or '').strip()
+                ports = item.get('ports') if isinstance(item.get('ports'), list) else [item.get('port')]
+                candidates.extend(f'{ip}:{int(port)}' for port in ports if ip and port is not None)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                match = re.match(r'^(?:https?://)?([a-zA-Z0-9.-]+(?::\d{1,5})?)$', line)
+                if match:
+                    candidates.append(match.group(1))
+            for candidate in candidates:
+                host = to_host(candidate)
+                if host:
+                    targets.append({"value": host, "label": candidate, "type": "host"})
 
     elif output_type == 'dirs':
         for line in lines:
@@ -2463,14 +2475,21 @@ def parse_output(tool_key, raw, default_target=''):
     return _dedup_assets(assets), findings
 
 def _finding_within_scope(initial_target, finding):
-    """Reject scanner matches attributed to a different origin."""
+    """Reject scanner matches outside the application or approved pivots."""
     if not initial_target:
         return True
     target = str(finding.get('target') or '').strip()
     if not target:
         return True
     if to_url(target):
-        return scoped_url(initial_target, target) is not None
+        scan_targets = finding.get('_scope_targets') or [initial_target]
+        try:
+            allowed_paths = normalize_allowed_paths(
+                os.environ.get('RECONX_SCOPE_PATH_ALLOWLIST', ''))
+        except ValueError:
+            allowed_paths = ()
+        return any(application_url(base, target, allowed_paths)
+                   for base in scan_targets if to_url(base))
     target_host = to_host(target)
     initial_host = to_host(initial_target)
     return not target_host or target_host.lower() == (initial_host or '').lower()
@@ -2480,9 +2499,14 @@ def persist_and_emit_findings(scan_id, assets, findings, sid):
     for a in assets:
         db_add_asset(scan_id, a['type'], a['value'])
     new_count = 0
+    scope_targets = active_scans.get(scan_id, {}).get(
+        'approved_scope_targets', [active_scans.get(scan_id, {}).get('target', '')])
     for f in findings:
+        f['_scope_targets'] = scope_targets
         if not _finding_within_scope(active_scans.get(scan_id, {}).get('target', ''), f):
+            f.pop('_scope_targets', None)
             continue
+        f.pop('_scope_targets', None)
         is_new, fid = db_add_finding(scan_id, f['tool'], f['ftype'], f['name'],
                                      f['severity'], f['target'], f['evidence'],
                                      f.get('confidence', 'possible'))
@@ -2730,13 +2754,28 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
 def run_adaptive_web(scan_id, targets, sid):
     scan = active_scans.get(scan_id, {})
     initial = to_url(scan.get('target', '')) or to_http_url(scan.get('target', ''))
-    report = {'pages': [], 'forms': [], 'tasks': [], 'pending': [], 'errors': [],
+    report = {'pages': [], 'page_details': [], 'resources': [], 'forms': [],
+              'tasks': [], 'pending': [], 'errors': [],
               'limits': {'pages': 12, 'depth': 2, 'jobs': 12, 'scripts': 24,
                          'source_maps': 8, 'artifact_bytes': 4194304},
               'truncated': False,
               'limitations': ['JavaScript não é executado; análise estática não observa estado de runtime da SPA',
                               'Login por listas exige configuração e critério de sucesso; uploads e fluxos destrutivos exigem revisão',
                               'completed indica processo concluído, não ausência de vulnerabilidades']}
+    try:
+        allowed_paths = normalize_allowed_paths(
+            os.environ.get('RECONX_SCOPE_PATH_ALLOWLIST', ''))
+    except ValueError as exc:
+        allowed_paths = ()
+        report['limitations'].append(
+            f'RECONX_SCOPE_PATH_ALLOWLIST ignorada por configuração inválida: {exc}')
+    if initial:
+        report['scope'] = {
+            'origin': urlunsplit((*urlsplit(initial)[:2], '', '', '')),
+            'base_path': application_base_path(initial),
+            'allowed_path_prefixes': list(allowed_paths),
+            'outside_base_behavior': 'inventory_only',
+        }
     for key, variable, ceiling in (('pages', 'RECONX_ADAPTIVE_PAGES', 200),
                                     ('depth', 'RECONX_ADAPTIVE_DEPTH', 5),
                                     ('jobs', 'RECONX_ADAPTIVE_JOBS', 100),
@@ -2761,7 +2800,7 @@ def run_adaptive_web(scan_id, targets, sid):
         def fetch(url, request_data=None):
             if scan.get('cancelled'):
                 raise RuntimeError('Scan cancelado')
-            if not scoped_url(initial, url):
+            if not application_url(initial, url, allowed_paths):
                 raise ValueError('URL fora do escopo')
             proxy = dict(active_proxy)
             artifact = urlsplit(url).path.lower().endswith(('.js', '.mjs', '.js.map', '.map'))
@@ -2804,12 +2843,14 @@ def run_adaptive_web(scan_id, targets, sid):
         pages, report['errors'], report['truncated'] = discover(initial, fetch, targets,
                                                                max_pages=report['limits']['pages'],
                                                                max_depth=report['limits']['depth'],
-                                                               cancelled=lambda: scan.get('cancelled', False))
+                                                               cancelled=lambda: scan.get('cancelled', False),
+                                                               allowed_paths=allowed_paths)
         report['reverse_engineering'] = reverse_engineer(
             initial, pages, fetch, max_scripts=report['limits']['scripts'],
             max_source_maps=report['limits']['source_maps'],
             cancelled=lambda: scan.get('cancelled', False),
-            jsluice_binary=resolve_binary('jsluice'))
+            jsluice_binary=resolve_binary('jsluice'),
+            allowed_paths=allowed_paths)
         reverse_summary = report['reverse_engineering']['summary']
         log('[Reverse] '
             f"{reverse_summary['scripts_analyzed']} scripts, "
@@ -2854,17 +2895,26 @@ def run_adaptive_web(scan_id, targets, sid):
             except (ValueError, OSError, RuntimeError) as exc:
                 report['login_testing'] = {'status': 'stopped', 'reason': str(exc)}
                 log(f'[Login] Não executado/interrompido: {exc}')
-        jobs, report['pending'] = plan_tests(initial, pages, max_jobs=report['limits']['jobs'])
+        jobs, report['pending'] = plan_tests(
+            initial, pages, max_jobs=report['limits']['jobs'],
+            allowed_paths=allowed_paths)
         if login_config.get('enabled'):
             for pending in report['pending']:
                 if 'BF e bypass lógico' in pending['reason']:
                     pending['reason'] = 'Bypass lógico exige revisão; resultado das tentativas por lista está em login_testing'
         report['pages'] = [p.url for p in pages]
+        report['page_details'] = [{
+            'url': p.url,
+            'content_type': getattr(p, 'content_type', ''),
+            'content_type_inferred': getattr(p, 'content_type_inferred', False),
+        } for p in pages]
+        report['resources'] = inventory_resources(initial, pages, allowed_paths)
         report['forms'] = [{'page': f['page'], 'action': f['action'], 'method': f['method'],
                             'login': f['login'], 'source': f.get('source', 'html'),
                             'fields': [v['name'] for v in f['fields']]}
                            for p in pages for f in [*p.forms, *p.script_requests]]
-        log(f"[Adaptive] {len(pages)} páginas, {len(report['forms'])} formulários; {len(jobs)} testes selecionados")
+        log(f"[Adaptive] {len(pages)} páginas, {len(report['resources'])} recursos, "
+            f"{len(report['forms'])} formulários; {len(jobs)} testes selecionados")
         if report['truncated']:
             log('[Adaptive] Há URLs na fila não analisadas: limite de páginas ou cancelamento atingido')
         report['tasks'] = [{'tool': j['tool'], 'url': j['url'], 'reason': j['reason'], 'status': 'pending'} for j in jobs]
@@ -3065,10 +3115,21 @@ def normalize_pivots(initial_target, pivots):
     return _dedup_assets(normalized)
 
 def pivot_expands_host(initial_target, pivots):
-    """Require review when a pivot changes host/port from the initial asset."""
+    """Require review when a pivot leaves the initial application boundary."""
     initial_host = (to_host(initial_target) or '').lower()
-    return any((to_host(p.get('value', '')) or '').lower() not in ('', initial_host)
-               for p in pivots)
+    try:
+        allowed_paths = normalize_allowed_paths(
+            os.environ.get('RECONX_SCOPE_PATH_ALLOWLIST', ''))
+    except ValueError:
+        allowed_paths = ()
+    for pivot in pivots:
+        value = str(pivot.get('value', ''))
+        if to_url(value):
+            if not application_url(initial_target, value, allowed_paths):
+                return True
+        elif (to_host(value) or '').lower() not in ('', initial_host):
+            return True
+    return False
 
 def run_ai_pipeline(scan_id, sid):
     scan = active_scans[scan_id]
@@ -3617,6 +3678,33 @@ def build_markdown_report(d: dict, findings=None, summary=None) -> str:
             tgt = f"  -  {fnd['target']}" if fnd.get('target') else ""
             lines.append(f"- **[{fnd['severity'].upper()}]** {fnd['name']} - `{fnd['tool']}`{tgt}")
         lines.append("")
+    adaptive = d.get('adaptive_report') or {}
+    resources = adaptive.get('resources', []) if isinstance(adaptive, dict) else []
+    if resources:
+        kinds = {}
+        for item in resources:
+            kind = str(item.get('kind', 'other'))
+            kinds[kind] = kinds.get(kind, 0) + 1
+        inferred = sum(1 for item in adaptive.get('page_details', [])
+                       if item.get('content_type_inferred'))
+        lines.append("## Inventário da superfície HTML")
+        lines.append("")
+        scope = adaptive.get('scope', {})
+        if scope:
+            allowlist = ', '.join(map(str, scope.get('allowed_path_prefixes', []))) or 'nenhuma'
+            lines.append(
+                f"- Escopo de aplicação: `{scope.get('base_path', '/')}`; "
+                f"allowlist adicional: {allowlist}; referências fora da base: inventário apenas.")
+        lines.append(f"- {len(resources)} referências deduplicadas; "
+                     + ", ".join(f"{kind}: {count}" for kind, count in sorted(kinds.items())) + ".")
+        if inferred:
+            lines.append(f"- {inferred} página(s) HTML reconhecida(s) por conteúdo porque o MIME estava ausente.")
+        for item in resources:
+            lines.append(
+                f"- `{item.get('kind', 'other')}` `{item.get('url', '?')}` "
+                f"({item.get('scope', 'unknown')}; "
+                f"{'navegável' if item.get('navigable') else 'inventário'})")
+        lines.append("")
     reverse = _reverse_report(d)
     if reverse:
         reverse_summary = reverse.get('summary', {})
@@ -3785,6 +3873,33 @@ def build_html_report(d: dict, findings=None, summary=None) -> str:
            f'<tbody>{rows_by_sev}</tbody></table>') if rows_by_sev else '<p style="color:#4e5a7a">Nenhum finding registrado.</p>'
 
     reverse = _reverse_report(d)
+    adaptive = d.get('adaptive_report') or {}
+    resources = adaptive.get('resources', []) if isinstance(adaptive, dict) else []
+    resource_section = ''
+    if resources:
+        resource_rows = ''.join(
+            '<tr>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("kind", "other")))}</td>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("url", "?")))}</td>'
+            f'<td style="padding:8px 10px">{esc(str(item.get("scope", "unknown")))}</td>'
+            f'<td style="padding:8px 10px">{"sim" if item.get("navigable") else "nao"}</td>'
+            f'<td style="padding:8px 10px">{esc(", ".join(map(str, item.get("sources", []))))}</td>'
+            '</tr>' for item in resources)
+        inferred = sum(1 for item in adaptive.get('page_details', [])
+                       if item.get('content_type_inferred'))
+        scope = adaptive.get('scope', {})
+        allowlist = ', '.join(map(str, scope.get('allowed_path_prefixes', []))) or 'nenhuma'
+        resource_section = f'''
+<h2>Inventario da superficie HTML</h2>
+<div style="color:#6272a4;margin-bottom:10px">
+  Base autorizada: <b>{esc(str(scope.get('base_path', '/')))}</b> &nbsp;|&nbsp;
+  Allowlist adicional: <b>{esc(allowlist)}</b><br>
+  Referencias deduplicadas: <b>{len(resources)}</b> &nbsp;|&nbsp;
+  HTML inferido sem MIME: <b>{inferred}</b>
+</div>
+<table><thead><tr><th>Tipo</th><th>URL</th><th>Escopo</th><th>Navegavel</th><th>Origem</th></tr></thead>
+<tbody>{resource_rows}</tbody></table>
+'''
     reverse_section = ''
     if reverse:
         reverse_summary = reverse.get('summary', {})
@@ -3871,6 +3986,7 @@ tr:hover td{{background:#0e1118}}
 </div>
 <h2>Findings por severidade</h2>
 {tbl}
+{resource_section}
 {reverse_section}
 <h2>Agrupamento por vetor de ataque</h2>
 {vector_sections or '<p style="color:#4e5a7a">Nenhum dado.</p>'}
@@ -3965,6 +4081,7 @@ def on_start(data):
         'status': 'running', 'target': target, 'sid': sid, 'intensity': data.get('intensity', 'full'),
         'login_testing': login_config,
         'ai_config': ai_config,
+        'approved_scope_targets': [target],
     }
     emit('pipeline_started', {
         'scan_id': scan_id, 'target': target, 'host_id': host_id,
@@ -4054,6 +4171,10 @@ def on_approve(data):
     all_results  = scan.get('all_results', {})
     all_followups = scan.get('all_followups', [])
     initial_target = scan['target']
+    approved_scope = scan.setdefault('approved_scope_targets', [initial_target])
+    for target in approved:
+        if to_url(target) and target not in approved_scope:
+            approved_scope.append(target)
     scan['status'] = 'running'
 
     emit('checkpoint_resumed', {

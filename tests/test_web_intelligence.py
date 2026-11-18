@@ -14,7 +14,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from web_intelligence import (scoped_url, parse_page, discover, plan_tests, form_request,
-                              reverse_engineer)
+                              reverse_engineer, inventory_resources, application_url,
+                              application_base_path, normalize_allowed_paths)
 from test_proxy import load_helpers
 
 BASE = 'http://lab.test:8080/meOwna/'
@@ -29,6 +30,19 @@ class WebIntelligenceTests(unittest.TestCase):
         for url in ('http://external.test/', 'https://lab.test:8080/', 'http://lab.test/',
                     'http://user:secret@lab.test:8080/', 'javascript:alert(1)', '//evil.test/'):
             self.assertIsNone(scoped_url(BASE, url))
+
+    def test_application_scope_is_path_bounded_with_explicit_allowlist(self):
+        self.assertEqual(application_base_path(BASE), '/meOwna/')
+        self.assertEqual(application_base_path(BASE + 'login.php'), '/meOwna/')
+        self.assertIsNone(application_url(BASE, '/admin'))
+        self.assertIsNone(application_url(BASE, '/meOwna/../admin'))
+        self.assertIsNone(application_url(BASE, '/meOwna/%2e%2e/admin'))
+        self.assertEqual(application_url(BASE, '/api/users', ('/api/',)),
+                         'http://lab.test:8080/api/users')
+        self.assertEqual(normalize_allowed_paths('/api/, /graphql'),
+                         ('/api/', '/graphql/'))
+        with self.assertRaises(ValueError):
+            normalize_allowed_paths('https://evil.test/api/')
 
     def test_login_post_and_hidden_token_are_preserved(self):
         html = '''<form method=POST action="login.php"><input name=user>
@@ -115,7 +129,7 @@ class WebIntelligenceTests(unittest.TestCase):
                 return {'status': 200, 'body': source_map, 'content_type': 'application/json'}
             raise AssertionError(f'fetch externo inesperado: {url}')
 
-        report = reverse_engineer(BASE, [page], fetch)
+        report = reverse_engineer(BASE, [page], fetch, allowed_paths=('/api/',))
         self.assertEqual(fetched, [BASE + 'js/app.js', BASE + 'js/app.js.map'])
         self.assertEqual(report['external_scripts'], ['https://cdn.example/vendor.js'])
         patch = next(e for e in report['endpoints'] if e['method'] == 'PATCH')
@@ -128,6 +142,17 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual(report['graphql_operations'], [{'type': 'mutation', 'name': 'InviteUser'}])
         self.assertIn('src/services/UserService.ts', report['source_maps'][0]['sources'])
         self.assertTrue(any(edge['operation'] == 'PATCH' for edge in report['architecture_edges']))
+
+    def test_same_origin_endpoint_outside_base_is_inventory_only(self):
+        page = parse_page(BASE, '<script>fetch("/api/users")</script>')
+        report = reverse_engineer(BASE, [page], lambda url: None)
+        endpoint = report['endpoints'][0]
+        self.assertFalse(endpoint['in_scope'])
+        self.assertEqual(endpoint['scope'], 'same_origin_outside_base')
+        allowed = reverse_engineer(
+            BASE, [page], lambda url: None, allowed_paths=('/api/',))['endpoints'][0]
+        self.assertTrue(allowed['in_scope'])
+        self.assertEqual(allowed['scope'], 'in_scope')
 
     def test_vendor_script_is_inventoried_without_business_signal_noise(self):
         page = parse_page(BASE, '<script src="js/vendor/library.js"></script>')
@@ -201,6 +226,73 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual(fetched, [BASE, BASE + 'search.php?q=hello'])
         self.assertEqual(len(pages), 2)
         self.assertEqual(errors, [])
+
+    def test_crawler_does_not_fetch_same_origin_links_outside_application_base(self):
+        fetched = []
+        def fetch(url):
+            fetched.append(url)
+            return self.response('<a href="/admin">admin</a><a href="inside.php">inside</a>')
+        pages, errors, _ = discover(BASE, fetch, max_pages=5)
+        self.assertEqual(fetched, [BASE, BASE + 'inside.php'])
+        self.assertEqual(errors, [])
+        resources = inventory_resources(BASE, pages)
+        outside = next(item for item in resources if item['url'].endswith('/admin'))
+        self.assertEqual(outside['scope'], 'same_origin_outside_base')
+
+    def test_crawler_sniffs_html_when_content_type_is_missing(self):
+        fetch = MagicMock(return_value={
+            'status': 200, 'body': '<!doctype html><html><body>Lab</body></html>',
+            'content_type': '',
+        })
+        pages, errors, _ = discover(BASE, fetch)
+        self.assertEqual(errors, [])
+        self.assertEqual([page.url for page in pages], [BASE])
+        self.assertTrue(pages[0].content_type_inferred)
+
+    def test_crawler_does_not_sniff_arbitrary_missing_mime_content_as_html(self):
+        fetch = MagicMock(return_value={
+            'status': 200, 'body': '{"message":"not html"}', 'content_type': '',
+        })
+        pages, errors, _ = discover(BASE, fetch)
+        self.assertEqual(pages, [])
+        self.assertEqual(errors[0]['reason'], 'Resposta não HTML')
+
+    def test_crawler_respects_explicit_non_html_content_type(self):
+        fetch = MagicMock(return_value={
+            'status': 200, 'body': '{"template":"<html><body>x</body></html>"}',
+            'content_type': 'application/json',
+        })
+        pages, errors, _ = discover(BASE, fetch)
+        self.assertEqual(pages, [])
+        self.assertEqual(errors[0]['reason'], 'Resposta não HTML')
+
+    def test_resource_inventory_keeps_documents_assets_frames_and_external_refs(self):
+        page = parse_page(BASE, '''
+            <link rel="stylesheet" href="css/app.css">
+            <link rel="manifest" href="site.webmanifest">
+            <a href="manual.pdf">Manual</a>
+            <img src="img/logo.png" srcset="img/logo@2x.png 2x">
+            <iframe src="help/index.html"></iframe>
+            <script src="https://cdn.example/app.js"></script>
+        ''')
+        resources = inventory_resources(BASE, [page])
+        by_url = {item['url']: item for item in resources}
+        self.assertEqual(by_url[BASE + 'manual.pdf']['kind'], 'document')
+        self.assertEqual(by_url[BASE + 'site.webmanifest']['kind'], 'manifest')
+        self.assertEqual(by_url[BASE + 'help/index.html']['kind'], 'frame')
+        self.assertTrue(by_url[BASE + 'help/index.html']['navigable'])
+        self.assertEqual(by_url['https://cdn.example/app.js']['scope'], 'external')
+        self.assertIn(BASE + 'img/logo@2x.png', by_url)
+
+    def test_invalid_template_reference_is_inventoried_but_never_fetched(self):
+        raw = "<?php echo 'https://dynamic.example/app.js'; ?>"
+        page = parse_page(BASE, f'<script src="{raw}"></script>')
+        self.assertEqual(page.script_sources, [])
+        resources = inventory_resources(BASE, [page])
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['scope'], 'invalid')
+        self.assertFalse(resources[0]['valid'])
+        self.assertIsNone(scoped_url(BASE, resources[0]['url']))
 
     def test_external_redirect_is_never_fetched(self):
         fetch = MagicMock(return_value={'status': 302, 'location': 'http://evil.test/'})
@@ -311,7 +403,9 @@ class WebIntelligenceTests(unittest.TestCase):
         ns.update(tempfile=tempfile, http=http, urllib=urllib, json=json, os=os,
                   discover=discover, plan_tests=plan_tests, parse_page=parse_page,
                   form_request=form_request, scoped_url=scoped_url,
-                  reverse_engineer=reverse_engineer)
+                  reverse_engineer=reverse_engineer, inventory_resources=inventory_resources,
+                  application_url=application_url, application_base_path=application_base_path,
+                  normalize_allowed_paths=normalize_allowed_paths)
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)
         ns['active_scans']['scan']['target'] = BASE
         html = '<form method=POST action=search.php><input name=q><button name=go value=Search>Search</button></form>'
@@ -350,7 +444,9 @@ class WebIntelligenceTests(unittest.TestCase):
         ns.update(tempfile=tempfile, http=http, urllib=urllib, json=json, os=os,
                   discover=discover, plan_tests=plan_tests, parse_page=parse_page,
                   form_request=form_request, scoped_url=scoped_url,
-                  reverse_engineer=reverse_engineer,
+                  reverse_engineer=reverse_engineer, inventory_resources=inventory_resources,
+                  application_url=application_url, application_base_path=application_base_path,
+                  normalize_allowed_paths=normalize_allowed_paths,
                   candidate_sources=candidate_sources, eligible_login_forms=eligible_login_forms,
                   run_login_tests=run_login_tests, _finding=lambda *args: {})
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)

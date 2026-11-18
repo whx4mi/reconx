@@ -137,6 +137,20 @@ sudo ./install.sh
 O instalador preserva resultados existentes por padrão e tenta instalar as ferramentas suportadas.
 Entre as integrações opcionais, `jsluice` complementa a engenharia reversa de
 JavaScript com análise AST de endpoints e parâmetros sem executar o código.
+Para OSINT passivo de ativos públicos, o pipeline **Cloud Attack Surface** usa
+`uncover` com consulta Shodan precisa por `domain:`. Configure a chave somente
+na VM, nunca no repositório ou na linha de comando:
+
+```bash
+sudo install -d -m 700 /root/.config/uncover
+sudoedit /root/.config/uncover/provider-config.yaml
+# conteúdo: shodan: seguido por uma lista YAML contendo a chave
+sudo chmod 600 /root/.config/uncover/provider-config.yaml
+```
+
+O ReconX não envia essa chave em argv nem a grava em resultados. Ativos retornados
+pelo Shodan continuam candidatos e exigem aprovação de escopo antes de qualquer
+teste ativo.
 Para instalar somente a aplicação:
 
 ```bash

@@ -53,7 +53,15 @@ class PipelineResilienceTests(unittest.TestCase):
     def test_reports_render_reverse_engineering_map_and_escape_html(self):
         data = {
             'target': 'http://lab.test/app/', 'scan_id': 'map-test',
-            'results': {}, 'adaptive_report': {'reverse_engineering': {
+            'results': {}, 'adaptive_report': {
+                'page_details': [{'url': 'http://lab.test/app/',
+                                  'content_type': '', 'content_type_inferred': True}],
+                'scope': {'base_path': '/app/', 'allowed_path_prefixes': ['/api/'],
+                          'outside_base_behavior': 'inventory_only'},
+                'resources': [{'url': 'http://lab.test/app/manual.pdf',
+                               'kind': 'document', 'scope': 'in_scope',
+                               'navigable': True, 'sources': ['http://lab.test/app/']}],
+                'reverse_engineering': {
                 'summary': {'scripts_analyzed': 2, 'source_maps': 1,
                             'endpoints': 1, 'in_scope_endpoints': 1},
                 'frameworks': ['React<script>'],
@@ -71,11 +79,17 @@ class PipelineResilienceTests(unittest.TestCase):
         markdown = reconx.build_markdown_report(data)
         html = reconx.build_html_report(data)
         self.assertIn('Mapa estático da aplicação', markdown)
+        self.assertIn('Inventário da superfície HTML', markdown)
+        self.assertIn('manual.pdf', markdown)
+        self.assertIn('Escopo de aplicação: `/app/`', markdown)
         self.assertIn('POST', markdown)
         self.assertIn('app.js.map', markdown)
         self.assertIn('query Viewer', markdown)
         self.assertIn('tenantId', markdown)
         self.assertIn('Mapa estatico da aplicacao', html)
+        self.assertIn('Inventario da superficie HTML', html)
+        self.assertIn('manual.pdf', html)
+        self.assertIn('Base autorizada: <b>/app/</b>', html)
         self.assertIn('http://lab.test/api?a=&lt;x&gt;', html)
         self.assertIn('React&lt;script&gt;', html)
         self.assertIn('src/services/User.ts', html)
@@ -119,6 +133,8 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertEqual(pivots[0]['value'], 'http://lab.test/app/ping.php')
         self.assertFalse(reconx.pivot_expands_host(base, pivots[:1]))
         self.assertTrue(reconx.pivot_expands_host(base, pivots))
+        self.assertTrue(reconx.pivot_expands_host(base, [
+            {'type': 'url', 'value': 'http://lab.test/admin', 'label': 'admin'}]))
 
     def test_web_tools_keep_application_path_while_port_tools_receive_host(self):
         targets = ['http://lab.test/app/', 'lab.test']
@@ -132,6 +148,20 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertIn('http://lab.test/app/', cmd)
         ffuf, _ = reconx.build_cmd('ffuf_dirs', 'http://lab.test/app/')
         self.assertIn('http://lab.test/app/FUZZ', ffuf)
+
+    def test_uncover_uses_precise_shodan_query_and_parses_plain_or_json_hosts(self):
+        command, effective = reconx.build_cmd('uncover', 'https://example.test/app/')
+        self.assertEqual(effective, 'example.test')
+        self.assertEqual(command[command.index('-e') + 1], 'shodan')
+        self.assertEqual(command[command.index('-q') + 1], 'domain:example.test')
+        self.assertNotIn('SHODAN_API_KEY', ' '.join(command))
+        plain = reconx.extract_targets('uncover', '192.0.2.10:443\nhost.example.test:8443')
+        structured = reconx.extract_targets(
+            'uncover', '{"ip":"192.0.2.20","ports":[80,443]}')
+        self.assertEqual([item['value'] for item in plain],
+                         ['192.0.2.10:443', 'host.example.test:8443'])
+        self.assertEqual([item['value'] for item in structured],
+                         ['192.0.2.20:80', '192.0.2.20:443'])
 
     def test_web_scanners_do_not_follow_redirects_and_gobuster_flag_is_current(self):
         for tool in ('sqlmap', 'sqlmap_url', 'commix'):
@@ -172,6 +202,26 @@ class PipelineResilienceTests(unittest.TestCase):
             self.assertEqual(count, 0)
             self.assertEqual(reconx.db_findings(scan_id), [])
         finally:
+            reconx.active_scans.pop(scan_id, None)
+
+    def test_same_origin_finding_outside_base_requires_approved_pivot(self):
+        scan_id = f'scope-{uuid.uuid4().hex}'
+        base = 'http://lab.test/app/'
+        target = 'http://lab.test/admin?q=x'
+        reconx.active_scans[scan_id] = {
+            'target': base, 'approved_scope_targets': [base]}
+        finding = reconx._finding('nuclei_misconfig', 'vuln', 'Outside base',
+                                  'info', target, 'same origin')
+        try:
+            self.assertEqual(
+                reconx.persist_and_emit_findings(scan_id, [], [finding], 'sid'), 0)
+            reconx.active_scans[scan_id]['approved_scope_targets'].append(
+                'http://lab.test/admin')
+            self.assertEqual(
+                reconx.persist_and_emit_findings(scan_id, [], [finding], 'sid'), 1)
+        finally:
+            with reconx._db() as connection:
+                connection.execute('DELETE FROM findings WHERE scan_id=?', (scan_id,))
             reconx.active_scans.pop(scan_id, None)
 
     def test_active_scanners_receive_only_compatible_web_targets(self):

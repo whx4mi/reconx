@@ -8,6 +8,19 @@ antes dos testes gerais. Também é possível selecionar a ferramenta
 A etapa busca HTML a partir do alvo original e das URLs já descobertas,
 segue links da mesma origem (esquema, host e porta) e identifica formulários,
 campos de texto, textarea, select, campos ocultos, tokens e parâmetros na URL.
+HTML sem `Content-Type` também é aceito quando uma inspeção conservadora encontra
+estrutura inequívoca de documento; o relatório marca `content_type_inferred` para
+que o analista saiba que o servidor omitiu o MIME. Frames e meta refresh same-origin
+entram na fila de navegação. Referências HTML a documentos, archives, scripts,
+estilos, imagens, mídia, manifests, frames, forms e terceiros são deduplicadas em
+`resources`, mas assets e terceiros não viram alvos de scanner automaticamente.
+Por padrão, a etapa limita navegação, redirects, scripts, source maps, forms e
+endpoints ao prefixo da aplicação fornecido no alvo. Uma referência na mesma
+origem, mas fora desse prefixo, fica registrada como `same_origin_outside_base`
+e não é acessada. APIs absolutas autorizadas podem ser liberadas explicitamente
+com uma lista de prefixos, por exemplo
+`RECONX_SCOPE_PATH_ALLOWLIST=/api/,/graphql`; a lista aceita apenas paths, nunca
+origens adicionais. A política aplicada fica persistida no bloco `scope`.
 Também reconhece requisições `fetch()` literais construídas com
 `URLSearchParams` em scripts inline, sem executar o JavaScript. Ela preserva
 os caminhos, query strings e campos duplicados.
