@@ -34,6 +34,10 @@ from web_intelligence import (discover, plan_tests, parse_page, form_request,
 from login_testing import validate_config as validate_login_config, candidate_sources, run_login_tests, eligible_login_forms
 import ai_pipeline
 from host_profiles import Store as HostStore, canonical_host
+from core.scope import ScopePolicy
+from core.storage import Store as CoreStore
+from core.analyzer import analyze as analyze_attack_surface
+from core.reporter import build_analysis_guide
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('RECONX_SECRET') or secrets.token_hex(16)
@@ -72,7 +76,19 @@ WEBHOOK_URL = os.environ.get('RECONX_WEBHOOK', '')
 # ==============================================================================
 
 DB_PATH = RESULTS_DIR / 'reconx.db'
+core_store = CoreStore(DB_PATH)
 _db_lock = threading.Lock()
+PROFILE_CONFIG = {
+    'passive': {'timeout_factor': 0.65, 'concurrency': 1, 'allow_active': False,
+                'allowed_tags': {'passive', 'fast'}},
+    'standard': {'timeout_factor': 1.0, 'concurrency': 1, 'allow_active': True,
+                 'allowed_tags': None},
+    'deep': {'timeout_factor': 1.5, 'concurrency': 1, 'allow_active': True,
+             'allowed_tags': None},
+}
+DEFAULT_SCOPE_POLICY = {'in_scope': [], 'out_of_scope': []}
+MAX_CONCURRENT_SCANS = max(1, int(os.environ.get('RECONX_MAX_CONCURRENT_SCANS', '3')))
+_scan_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
 
 SEVERITIES = ['critical', 'high', 'medium', 'low', 'info', 'unknown']
 SEV_RANK = {sv: i for i, sv in enumerate(reversed(SEVERITIES))}
@@ -92,9 +108,41 @@ CREATE TABLE IF NOT EXISTS assets (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT, atype TEXT, value TEXT,
     created_at TEXT, UNIQUE(scan_id, atype, value)
 );
+CREATE TABLE IF NOT EXISTS stage_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+    stage_id TEXT NOT NULL, stage_name TEXT NOT NULL, operational_phase TEXT NOT NULL,
+    status TEXT NOT NULL, input_count INTEGER DEFAULT 0, output_count INTEGER DEFAULT 0,
+    finding_count INTEGER DEFAULT 0,
+    detail TEXT, started_at TEXT, finished_at TEXT,
+    UNIQUE(scan_id, stage_id)
+);
+CREATE TABLE IF NOT EXISTS tool_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+    stage_id TEXT NOT NULL, tool TEXT NOT NULL, target TEXT,
+    status TEXT NOT NULL, reason TEXT, exit_code INTEGER, timed_out INTEGER DEFAULT 0,
+    output_path TEXT, started_at TEXT, finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS discovery_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+    origin_stage TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
+    disposition TEXT NOT NULL DEFAULT 'pending', reason TEXT,
+    created_at TEXT, updated_at TEXT,
+    UNIQUE(scan_id, kind, value)
+);
+CREATE TABLE IF NOT EXISTS coverage_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+    phase TEXT NOT NULL, objective TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL, reason TEXT, evidence_ref TEXT,
+    created_at TEXT, updated_at TEXT,
+    UNIQUE(scan_id, phase, objective, subject)
+);
 CREATE INDEX IF NOT EXISTS idx_find_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_asset_scan ON assets(scan_id);
+CREATE INDEX IF NOT EXISTS idx_stage_run_scan ON stage_runs(scan_id);
+CREATE INDEX IF NOT EXISTS idx_tool_run_scan ON tool_runs(scan_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_scan ON discovery_items(scan_id);
+CREATE INDEX IF NOT EXISTS idx_coverage_scan ON coverage_items(scan_id);
 """
 
 @contextmanager
@@ -111,6 +159,14 @@ def db_init():
     with _db_lock, _db() as c:
         c.execute("PRAGMA journal_mode=WAL;")
         c.executescript(DB_SCHEMA)
+        columns = {row['name'] for row in c.execute('PRAGMA table_info(scans)')}
+        if 'scope_json' not in columns:
+            c.execute("ALTER TABLE scans ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'")
+        if 'profile' not in columns:
+            c.execute("ALTER TABLE scans ADD COLUMN profile TEXT NOT NULL DEFAULT 'standard'")
+        stage_columns = {row['name'] for row in c.execute('PRAGMA table_info(stage_runs)')}
+        if 'finding_count' not in stage_columns:
+            c.execute('ALTER TABLE stage_runs ADD COLUMN finding_count INTEGER NOT NULL DEFAULT 0')
 
 def db_reconcile_orphaned_scans():
     """Fail scans that cannot still have a worker after this process started."""
@@ -121,19 +177,137 @@ def db_reconcile_orphaned_scans():
             "WHERE status='running' AND finished_at IS NULL",
             (finished_at,),
         )
+        c.execute("UPDATE stage_runs SET status='failed', detail=?, finished_at=? "
+                  "WHERE status='running' AND finished_at IS NULL",
+                  ('Execução interrompida pela reinicialização do ReconX', finished_at))
+        c.execute("UPDATE tool_runs SET status='failed', reason=?, finished_at=? "
+                  "WHERE status='running' AND finished_at IS NULL",
+                  ('Execução interrompida pela reinicialização do ReconX', finished_at))
         return cursor.rowcount
 
-def db_create_scan(scan_id, target, pipeline, proxy):
+def db_create_scan(scan_id, target, pipeline, proxy, scope_policy=None, profile='standard'):
     with _db_lock, _db() as c:
         c.execute("""INSERT OR REPLACE INTO scans
-            (scan_id,target,pipeline,proxy,status,started_at,finished_at)
-            VALUES(?,?,?,?,?,?,NULL)""",
-            (scan_id, target, pipeline, proxy, 'running', datetime.now().isoformat()))
+            (scan_id,target,pipeline,proxy,status,started_at,finished_at,scope_json,profile)
+            VALUES(?,?,?,?,?,?,NULL,?,?)""",
+            (scan_id, target, pipeline, proxy, 'running', datetime.now().isoformat(),
+             json.dumps(scope_policy or {}, ensure_ascii=False), profile))
+        now = datetime.now().isoformat()
+        for phase, definition in OPERATIONAL_PHASES.items():
+            c.execute("""INSERT OR REPLACE INTO coverage_items
+                (scan_id,phase,objective,subject,status,reason,evidence_ref,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (scan_id, phase, definition['objective'], '', 'planned', '', '', now, now))
 
 def db_finish_scan(scan_id, status='done'):
     with _db_lock, _db() as c:
         c.execute("UPDATE scans SET status=?, finished_at=? WHERE scan_id=?",
                   (status, datetime.now().isoformat(), scan_id))
+
+def db_start_stage(scan_id, stage, operational_phase, input_count):
+    now = datetime.now().isoformat()
+    with _db_lock, _db() as c:
+        c.execute("""INSERT INTO stage_runs
+            (scan_id,stage_id,stage_name,operational_phase,status,input_count,output_count,
+             finding_count,detail,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,NULL)
+            ON CONFLICT(scan_id,stage_id) DO UPDATE SET
+              stage_name=excluded.stage_name, operational_phase=excluded.operational_phase,
+              status='running', input_count=excluded.input_count, output_count=0,
+              finding_count=0,
+              detail=NULL, started_at=excluded.started_at, finished_at=NULL""",
+            (scan_id, stage['id'], stage['name'], operational_phase, 'running',
+             input_count, 0, 0, None, now))
+        c.execute("UPDATE coverage_items SET status='running',reason='',updated_at=? "
+                  "WHERE scan_id=? AND phase=?", (now, scan_id, operational_phase))
+
+def db_finish_stage(scan_id, stage_id, status, output_count=0, detail='', finding_count=0):
+    now = datetime.now().isoformat()
+    with _db_lock, _db() as c:
+        c.execute("UPDATE stage_runs SET status=?,output_count=?,finding_count=?,detail=?,finished_at=? "
+                  "WHERE scan_id=? AND stage_id=?",
+                  (status, output_count, finding_count, detail, now, scan_id, stage_id))
+        phase = c.execute("SELECT operational_phase FROM stage_runs WHERE scan_id=? AND stage_id=?",
+                          (scan_id, stage_id)).fetchone()
+        if phase:
+            statuses = [row['status'] for row in c.execute(
+                "SELECT status FROM stage_runs WHERE scan_id=? AND operational_phase=?",
+                (scan_id, phase['operational_phase']))]
+            phase_status = ('failed' if statuses and all(s == 'failed' for s in statuses)
+                            else 'cancelled' if statuses and all(s == 'cancelled' for s in statuses)
+                            else 'completed_with_gaps' if any(s != 'completed' for s in statuses)
+                            else 'completed')
+            c.execute("UPDATE coverage_items SET status=?,reason=?,updated_at=? "
+                      "WHERE scan_id=? AND phase=?",
+                      (phase_status, detail if phase_status != 'completed' else '', now,
+                       scan_id, phase['operational_phase']))
+
+def db_start_tool_run(scan_id, stage_id, tool, target):
+    with _db_lock, _db() as c:
+        cur = c.execute("""INSERT INTO tool_runs
+            (scan_id,stage_id,tool,target,status,started_at)
+            VALUES(?,?,?,?,?,?)""",
+            (scan_id, stage_id, tool, target or '', 'running', datetime.now().isoformat()))
+        return cur.lastrowid
+
+def db_finish_tool_run(run_id, outcome, output_path=None):
+    with _db_lock, _db() as c:
+        c.execute("""UPDATE tool_runs SET status=?,reason=?,exit_code=?,timed_out=?,
+            output_path=?,finished_at=? WHERE id=?""",
+            (outcome.get('status', 'failed'), outcome.get('reason', ''),
+             outcome.get('exit_code'), int(bool(outcome.get('timed_out'))), output_path,
+             datetime.now().isoformat(), run_id))
+
+def db_record_discoveries(scan_id, stage_id, discoveries):
+    now = datetime.now().isoformat()
+    with _db_lock, _db() as c:
+        for item in discoveries:
+            c.execute("""INSERT INTO discovery_items
+                (scan_id,origin_stage,kind,value,disposition,reason,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(scan_id,kind,value) DO NOTHING""",
+                (scan_id, stage_id, item.get('type', 'unknown'), str(item.get('value', '')),
+                 'pending', '', now, now))
+
+def db_dispose_discoveries(scan_id, values, disposition, reason):
+    values = list(dict.fromkeys(str(value) for value in values if value))
+    if not values:
+        return
+    placeholders = ','.join('?' for _ in values)
+    with _db_lock, _db() as c:
+        c.execute(f"UPDATE discovery_items SET disposition=?,reason=?,updated_at=? "
+                  f"WHERE scan_id=? AND value IN ({placeholders})",
+                  (disposition, reason, datetime.now().isoformat(), scan_id, *values))
+
+def db_update_coverage(scan_id, phase, status, reason='', evidence_ref=''):
+    with _db_lock, _db() as c:
+        c.execute("UPDATE coverage_items SET status=?,reason=?,evidence_ref=?,updated_at=? "
+                  "WHERE scan_id=? AND phase=?",
+                  (status, reason, evidence_ref, datetime.now().isoformat(), scan_id, phase))
+
+def db_close_unreached_coverage(scan_id, status, reason):
+    with _db_lock, _db() as c:
+        c.execute("UPDATE coverage_items SET status=?,reason=?,updated_at=? "
+                  "WHERE scan_id=? AND status IN ('planned','running','blocked')",
+                  (status, reason, datetime.now().isoformat(), scan_id))
+
+def db_operational_ledger(scan_id):
+    with _db_lock, _db() as c:
+        scan = c.execute("SELECT * FROM scans WHERE scan_id=?", (scan_id,)).fetchone()
+        coverage = [dict(row) for row in c.execute(
+            "SELECT * FROM coverage_items WHERE scan_id=? ORDER BY id", (scan_id,))]
+        stages = [dict(row) for row in c.execute(
+            "SELECT * FROM stage_runs WHERE scan_id=? ORDER BY id", (scan_id,))]
+        tools = [dict(row) for row in c.execute(
+            "SELECT * FROM tool_runs WHERE scan_id=? ORDER BY id", (scan_id,))]
+        discoveries = [dict(row) for row in c.execute(
+            "SELECT * FROM discovery_items WHERE scan_id=? ORDER BY id", (scan_id,))]
+    return {'scan': dict(scan) if scan else None, 'coverage': coverage, 'stages': stages,
+            'tool_runs': tools, 'discoveries': discoveries,
+            'summary': {
+                'tools': {status: sum(1 for row in tools if row['status'] == status)
+                          for status in ('completed','completed_with_gaps','failed','skipped','cancelled')},
+                'discoveries': {status: sum(1 for row in discoveries if row['disposition'] == status)
+                                for status in ('pending','consumed','retained','not_approved','out_of_scope')},
+            }}
 
 def _finding_identity(tool, ftype, name, target):
     """Collapse scanner aliases that describe the same vulnerable input."""
@@ -223,7 +397,9 @@ def db_add_asset(scan_id, atype, value):
     with _db_lock, _db() as c:
         cur = c.execute("INSERT OR IGNORE INTO assets(scan_id,atype,value,created_at) VALUES(?,?,?,?)",
                         (scan_id, atype, value, datetime.now().isoformat()))
-        return cur.rowcount > 0
+        inserted = cur.rowcount > 0
+    core_store.upsert_asset(scan_id, atype, value, state='discovered')
+    return inserted
 
 def db_update_finding(scan_id, finding_id, confidence=None, evidence=None):
     """Atualiza confidence e/ou evidencia de um finding (usado pela verificacao)."""
@@ -261,6 +437,11 @@ def db_summary(scan_id):
             atypes[r['atype']] = r['n']
         total = c.execute("SELECT COUNT(*) n FROM findings WHERE scan_id=?", (scan_id,)).fetchone()['n']
     return {'severity': sev, 'assets': atypes, 'total': total}
+
+def validation_candidate_count(summary):
+    """Count triage candidates while excluding informational inventory signals."""
+    return sum(int(count or 0) for severity, count in
+               (summary.get('severity') or {}).items() if severity != 'info')
 
 try:
     db_init()
@@ -665,7 +846,7 @@ TOOLS = {
     },
     "naabu": {
         "label": "Naabu", "phase": "recon", "category": "ports",
-        "desc": "Port scanner rápido em Go (ignora CDN automaticamente)",
+        "desc": "Descoberta de portas TCP nas portas mais comuns",
         "cmd": ["naabu", "-host", "{host}", "-top-ports", "1000", "-silent", "-json", "-ec"],
         "input": "host", "output": "ports",
         "json": True, "binary": "naabu", "tags": ["active","ports","fast"],
@@ -755,12 +936,11 @@ TOOLS = {
     # RECON — FUZZING
     "ffuf_dirs": {
         "label": "FFUF Dirs", "phase": "recon", "category": "fuzzing",
-        "desc": "Fuzzing de diretórios com recursão automática (depth 2)",
+        "desc": "Enumeração de diretórios com limite de 5 requisições por segundo",
         "cmd": ["ffuf", "-u", "{base_url}FUZZ",
                 "-w", WL_SMALL or WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
                 "-mc", "200,201,204,301,302,307,401,403,405",
-                "-t", "40", "-ac", "-s",
-                "-recursion", "-recursion-depth", "2"],
+                "-t", "5", "-rate", "5", "-ac", "-s"],
         "input": "url", "output": "dirs",
         "binary": "ffuf", "tags": ["active","fuzzing"],
         "proxy_support": True,
@@ -772,12 +952,13 @@ TOOLS = {
     },
     "ffuf_ext": {
         "label": "FFUF Extensions", "phase": "recon", "category": "fuzzing",
-        "desc": "Fuzzing com extensões .php .html .bak .txt",
+        "desc": "Enumeração limitada de arquivos comuns com extensões",
         "cmd": ["ffuf", "-u", "{base_url}FUZZ",
-                "-w", WL_COMMON or "/usr/share/wordlists/dirb/common.txt",
-                "-e", ".php,.html,.txt,.bak,.old,.zip,.conf,.env,.log",
+                "-w", str(Path(globals().get('__file__') or Path.cwd() / 'app.py').resolve().parent
+                          / "wordlists" / "web-extension-candidates.txt"),
+                "-e", ".php,.html,.txt,.bak,.old,.conf,.zip,.log",
                 "-mc", "200,201,301,302,401,403",
-                "-t", "40", "-ac", "-s"],
+                "-t", "5", "-rate", "5", "-ac", "-s"],
         "input": "url", "output": "dirs",
         "binary": "ffuf", "tags": ["active","fuzzing"],
         "proxy_support": True,
@@ -874,8 +1055,8 @@ TOOLS = {
         "binary": "theHarvester", "tags": ["passive","osint"],
         "proxy_support": False,
         "manual_followup": [
-            "Emails encontrados: verifique em haveibeenpwned.com",
-            "Use emails para password spray ou phishing (se autorizado)",
+            "Trate endereços de e-mail como dados pessoais e mantenha-os em relatório restrito",
+            "Revise exposição e configuração de autenticação por fontes administrativas autorizadas",
         ],
     },
 
@@ -889,14 +1070,15 @@ TOOLS = {
         "proxy_support": True,
         "manual_followup": [
             "Valide manualmente cada finding do Nikto — tem falsos positivos",
-            "Métodos HTTP perigosos (PUT/DELETE): tente upload de webshell",
+            "Revise PUT/DELETE com uma requisição segura e sem gravar conteúdo no servidor",
         ],
     },
     "nuclei_cves": {
         "label": "Nuclei CVEs", "phase": "test", "category": "web_vuln",
         "desc": "CVEs críticos, altos e médios via templates",
         "cmd": ["nuclei", "-u", "{http_url}", "-tags", "cve",
-                "-severity", "critical,high,medium", "-jsonl", "-silent", "-dr"],
+                "-severity", "critical,high,medium", "-pt", "http",
+                "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "cves",
         "json": True, "binary": "nuclei", "tags": ["active","cve"],
         "proxy_support": True,
@@ -907,15 +1089,15 @@ TOOLS = {
     },
     "nuclei_misconfig": {
         "label": "Nuclei Misconfig", "phase": "test", "category": "web_vuln",
-        "desc": "Misconfigurations, exposições e default logins",
-        "cmd": ["nuclei", "-u", "{http_url}", "-tags", "misconfig,exposure,default-login",
-                "-jsonl", "-silent", "-dr"],
+        "desc": "Misconfigurações e exposições HTTP; sem tentativas de credenciais",
+        "cmd": ["nuclei", "-u", "{http_url}", "-tags", "misconfig,exposure",
+                "-pt", "http", "-jsonl", "-silent", "-dr"],
         "input": "url", "output": "misconfig",
         "json": True, "binary": "nuclei", "tags": ["active","misconfig"],
         "proxy_support": True,
         "manual_followup": [
-            "Default credentials encontradas: tente em outros serviços do alvo",
-            "Painéis admin expostos: tente brute force ou credential stuffing",
+            "Revise a configuração de credenciais padrão por evidência administrativa autorizada; não faça tentativas de senha",
+            "Painéis administrativos expostos: confirme o controle de acesso sem enviar credenciais não autorizadas",
         ],
     },
     "nuclei_tech": {
@@ -1001,10 +1183,11 @@ TOOLS = {
     # TEST — XSS
     "dalfox": {
         "label": "Dalfox (host)", "phase": "test", "category": "xss",
-        "desc": "Scanner XSS no host — detecta e gera PoC",
-        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence"],
+        "desc": "Scanner XSS em URLs com parâmetros — detecta e gera candidatos a PoC",
+        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence",
+                "--timeout", "20"],
         "input": "url", "output": "xss",
-        "binary": "dalfox", "tags": ["active","xss"],
+        "binary": "dalfox", "tags": ["active","xss"], "timeout": 240,
         "proxy_support": True,
         "manual_followup": [
             "XSS automatizado perde contextos complexos: teste com Burp Repeater",
@@ -1017,9 +1200,10 @@ TOOLS = {
     "dalfox_url": {
         "label": "Dalfox (URL params)", "phase": "test", "category": "xss",
         "desc": "XSS em parâmetros GET específicos",
-        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence"],
+        "cmd": ["dalfox", "url", "--url", "{url}", "--no-color", "--silence",
+                "--timeout", "20"],
         "input": "url", "output": "xss",
-        "binary": "dalfox", "tags": ["active","xss"],
+        "binary": "dalfox", "tags": ["active","xss"], "timeout": 240,
         "proxy_support": True,
         "manual_followup": [],
     },
@@ -1034,9 +1218,9 @@ TOOLS = {
         "binary": "wpscan", "tags": ["active","wordpress"],
         "proxy_support": True,
         "manual_followup": [
-            "Usuários encontrados: tente xmlrpc brute force",
+            "Usuários enumerados são sinais de exposição; não tente autenticação por listas",
             "Plugins desatualizados: pesquise CVE específico do plugin+versão",
-            "wp-login.php: tente credential stuffing com dados de breach",
+            "Revise controles de rate limiting e autenticação por configuração ou logs autorizados",
             "REST API exposta: /wp-json/wp/v2/users lista usuários",
         ],
     },
@@ -1085,7 +1269,7 @@ TOOLS = {
         "proxy_support": False,
         "manual_followup": [
             "Combine com dnsx para validar quais subdomínios estão ativos",
-            "amass enum -active -d {domain} para enumeração ativa com brute force",
+            "Correlacione os subdomínios encontrados com fontes passivas adicionais",
         ],
     },
     "findomain": {
@@ -1241,9 +1425,9 @@ MANUAL_CHECKLIST = {
         "label": "Autenticação & Sessão",
         "icon": "🔐",
         "checks": [
-            "Brute force no login — rate limiting está ativo?",
-            "Account lockout após N tentativas?",
-            "Senhas fracas aceitas? (admin/admin, 123456)",
+            "Revise rate limiting e alertas sem testar listas de senhas",
+            "Confirme a política de bloqueio por configuração ou logs autorizados",
+            "A política rejeita credenciais padrão e fracas? Verifique configuração ou conta sintética aprovada",
             "Forget password: oracle de usuários válidos?",
             "Tokens de sessão são aleatórios? (analise no Burp)",
             "Cookie session sem HttpOnly/Secure?",
@@ -1380,7 +1564,7 @@ MANUAL_CHECKLIST = {
         "checks": [
             "API versão antiga sem autenticação: /api/v1/ vs /api/v2/",
             "GraphQL introspection habilitada em produção? (query: {__schema{types{name}}})",
-            "GraphQL batching permite brute force? (array de mutations de login)",
+            "GraphQL batching tem limites por requisição e operação? Revise configuração e métricas",
             "GraphQL IDOR: busque campos id/userId em queries e manipule",
             "Rate limiting ausente em endpoints de autenticação?",
             "Mass assignment em PUT/PATCH: envie campos extras (role, isAdmin, verified)",
@@ -1566,6 +1750,54 @@ PIPELINES = {
         ]
     },
 }
+
+OPERATIONAL_PHASES = {
+    'recon': {
+        'order': 1, 'label': 'Reconhecimento',
+        'objective': 'Estabelecer o alvo, fingerprint e superfície inicial.',
+    },
+    'discovery': {
+        'order': 2, 'label': 'Descoberta e enumeração',
+        'objective': 'Transformar sinais em hosts, serviços, rotas e parâmetros acionáveis.',
+    },
+    'assessment': {
+        'order': 3, 'label': 'Varredura orientada',
+        'objective': 'Aplicar testes compatíveis apenas às entradas descobertas.',
+    },
+    'validation': {
+        'order': 4, 'label': 'Validação e PoC',
+        'objective': 'Confirmar ou descartar candidatos com evidência comportamental.',
+    },
+    'reporting': {
+        'order': 5, 'label': 'Relatório e reteste',
+        'objective': 'Consolidar cobertura, lacunas, achados e estado do reteste.',
+    },
+}
+
+def operational_phase_for_stage(stage, index):
+    """Map legacy recon/test stages into the operator-facing lifecycle.
+
+    The first non-test stage establishes the baseline. Later recon stages consume
+    that baseline to enumerate the surface. Active test stages generate candidates;
+    validation and reporting remain explicit downstream phases rather than being
+    implied by a scanner exit code.
+    """
+    if stage.get('operational_phase') in OPERATIONAL_PHASES:
+        return stage['operational_phase']
+    if stage.get('phase') == 'test':
+        return 'assessment'
+    return 'recon' if index == 0 else 'discovery'
+
+def pipelines_for_ui():
+    prepared = {}
+    for key, pipeline in PIPELINES.items():
+        item = dict(pipeline)
+        item['stages'] = [
+            {**stage, 'operational_phase': operational_phase_for_stage(stage, index)}
+            for index, stage in enumerate(pipeline.get('stages', []))
+        ]
+        prepared[key] = item
+    return prepared
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXECUÇÃO
@@ -1993,6 +2225,8 @@ _TOOL_NOISE = {
     # nmap/masscan: cabecalhos, preamble, linhas de script NSE
     'ports': re.compile(
         r'^Starting Nmap|^Nmap scan report|^Host is up|'
+        r'operation not permitted|host seems down|failed to open device|'
+        r'requires root privileges|failed to resolve|'
         r'^Not shown:|^PORT\s+STATE|'
         r'^\|[_\s]|'                               # linhas NSE: |_http-server-header
         r'^MAC Address:|^Service Info:|^OS (?:details|CPE):|'
@@ -2391,6 +2625,9 @@ def parse_output(tool_key, raw, default_target=''):
     assets, findings = [], []
     raw   = strip_ansi(raw)
     lines = [l for l in raw.splitlines() if l.strip()]
+    if tool_output_quality_issue(tool_key, raw):
+        return [], []
+    seen_ports = set()
 
     if is_json:
         for ln in lines:
@@ -2412,6 +2649,11 @@ def parse_output(tool_key, raw, default_target=''):
             elif otype == 'ports':
                 host = to_host(o.get('host') or o.get('ip') or '')
                 port = o.get('port')
+                protocol = str(o.get('protocol') or 'tcp').lower()
+                port_key = (host.lower(), str(port), protocol)
+                if tool_key == 'naabu' and port_key in seen_ports:
+                    continue
+                seen_ports.add(port_key)
                 if host: assets.append({'value': host, 'label': f"{host}:{port}", 'type': 'host'})
                 findings.append(_finding(tool_key, 'port', f"porta {port} aberta", 'info', host, str(port)))
             elif otype == 'subdomains':
@@ -2447,11 +2689,24 @@ def parse_output(tool_key, raw, default_target=''):
                 h = to_host(m.group(1))
                 if h: assets.append({'value': h, 'label': m.group(1), 'type': 'host'})
     elif otype == 'dirs':
+        seen_paths = set()
         for line in lines:
-            m = re.match(r'^(/[\w\.\-/]+)', line)
-            if m:
-                assets.append({'value': m.group(1), 'label': m.group(1), 'type': 'path'})
-                findings.append(_finding(tool_key, 'path', m.group(1), 'info', m.group(1)))
+            if tool_key in ('ffuf_dirs', 'ffuf_ext'):
+                candidate = line.strip()
+                if not re.fullmatch(r'/?[\w.\-/]+', candidate):
+                    continue
+                if '..' in candidate.split('/'):
+                    continue
+                path = '/' + candidate.lstrip('/')
+            else:
+                match = re.match(r'^(/[\w\.\-/]+)', line)
+                if not match:
+                    continue
+                path = match.group(1)
+            if path not in seen_paths:
+                seen_paths.add(path)
+                assets.append({'value': path, 'label': path, 'type': 'path'})
+                findings.append(_finding(tool_key, 'path', path, 'info', path))
     elif otype == 'urls':
         for line in lines:
             if line.startswith('http') and '?' in line and len(line) < 300:
@@ -2606,6 +2861,44 @@ def tool_execution_succeeded(tool_key, returncode, raw, timed_out=False):
     return (tool_key in ('dalfox', 'dalfox_url') and returncode == 1
             and re.search(r'\[POC\]\[V\]', raw, re.I) is not None)
 
+
+def tool_output_quality_issue(tool_key, raw):
+    """Reject unreliable output and identify completed probes with a coverage gap."""
+    if tool_key in ('sqlmap', 'sqlmap_url') and re.search(
+            r'there were no forms found at the given target URL', raw, re.I):
+        return 'SQLMap terminou sem encontrar formulários; injection via formulário não foi testada'
+
+    if tool_key.startswith('nmap_'):
+        operational_error = re.search(
+            r'operation not permitted|failed to open device|'
+            r'requires root privileges|you requested a scan type which requires root|'
+            r'host seems down|failed to resolve', raw, re.I)
+        if operational_error:
+            return f"Saída operacional do Nmap, sem resultado confiável: {operational_error.group(0)}"
+
+    if tool_key == 'naabu':
+        records = []
+        for line in raw.splitlines():
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict) and record.get('port') is not None:
+                host = str(record.get('host') or record.get('ip') or '').lower()
+                protocol = str(record.get('protocol') or 'tcp').lower()
+                records.append((host, str(record['port']), protocol))
+        unique = set(records)
+        duplicate_count = len(records) - len(unique)
+        duplicate_ratio = duplicate_count / len(records) if records else 0
+        if len(unique) > 100:
+            return (f"Saída inconclusiva do Naabu: {len(records)} registros, "
+                    f"{len(unique)} portas únicas e {duplicate_count} duplicados; "
+                    "limite de confiança excedido (100). Evidência bruta preservada.")
+        if len(records) >= 20 and duplicate_ratio >= 0.25:
+            return (f"Saída inconclusiva do Naabu: {duplicate_count} registros duplicados "
+                    f"em {len(records)} ({duplicate_ratio:.0%}). Evidência bruta preservada.")
+    return ''
+
 def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None, outcome=None):
     if outcome is not None:
         outcome['status'] = 'skipped'
@@ -2645,7 +2938,11 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
     if proxy.get('http') or proxy.get('socks'):
         proxy_info = f" [via {proxy.get('profile','proxy')}]"
 
-    timeout = tool.get('timeout', DEFAULT_TOOL_TIMEOUT)
+    profile = active_scans.get(scan_id, {}).get('profile', 'standard')
+    profile_config = globals().get('PROFILE_CONFIG', {
+        'standard': {'timeout_factor': 1.0}})
+    timeout_factor = profile_config.get(profile, profile_config['standard']).get('timeout_factor', 1.0)
+    timeout = int(tool.get('timeout', DEFAULT_TOOL_TIMEOUT) * timeout_factor)
 
     socketio.emit('tool_start', {
         'scan_id': scan_id, 'tool': tool_key,
@@ -2705,14 +3002,36 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         raw = '\n'.join(output_lines)
         output_path = _save_tool_output(scan_id, tool_key, raw_target, raw)
         successful = tool_execution_succeeded(tool_key, proc.returncode, raw, timed_out['flag'])
-        run_status = 'completed' if successful else 'failed'
+        quality_issue = tool_output_quality_issue(tool_key, raw)
+        if quality_issue:
+            successful = False
+        run_status = ('completed_with_gaps' if quality_issue else
+                      'completed' if successful else 'failed')
         if outcome is not None:
             outcome.update(status=run_status,
-                           exit_code=proc.returncode, timed_out=timed_out['flag'])
+                           exit_code=proc.returncode, timed_out=timed_out['flag'],
+                           output_path=output_path)
+            if timed_out['flag']:
+                outcome['reason'] = f'Timeout de {timeout}s'
+            elif quality_issue:
+                outcome['reason'] = quality_issue
+            elif active_scans.get(scan_id, {}).get('cancelled'):
+                outcome.update(status='cancelled', reason='Scan cancelada pelo operador')
         # A failed invocation often prints usage/help/error text that resembles
         # findings. Only successful scanner output is eligible for parsing.
         if successful:
+            try:
+                core_store.upsert_asset(scan_id, 'target', raw_target,
+                                        {'tool': tool_key, 'status': 'probed'}, state='probed')
+            except (ValueError, sqlite3.Error):
+                pass
             assets, findings = parse_output(tool_key, raw, effective_target)
+            for asset in assets:
+                try:
+                    core_store.upsert_asset(scan_id, asset.get('type', 'unknown'),
+                                            asset.get('value', ''), asset, state='enumerated')
+                except (ValueError, sqlite3.Error):
+                    pass
             if tool_key in ('dalfox', 'dalfox_url'):
                 findings = validate_dalfox_findings(findings)
         else:
@@ -2736,6 +3055,8 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
             'lines': len(output_lines), 'elapsed': elapsed,
             'exit_code': proc.returncode,
             'success': successful,
+            'status': run_status,
+            'reason': (outcome or {}).get('reason', ''),
             'timed_out': timed_out['flag'],
             'extracted_targets': extracted,
             'manual_followup': followup,
@@ -2751,7 +3072,7 @@ def run_tool_sequential(scan_id, tool_key, raw_target, sid, request_context=None
         socketio.emit('tool_error', {'scan_id':scan_id,'tool':tool_key,'error':str(e)}, room=sid)
         return '', []
 
-def run_adaptive_web(scan_id, targets, sid):
+def run_adaptive_web(scan_id, targets, sid, stage_id=None):
     scan = active_scans.get(scan_id, {})
     initial = to_url(scan.get('target', '')) or to_http_url(scan.get('target', ''))
     report = {'pages': [], 'page_details': [], 'resources': [], 'forms': [],
@@ -2951,7 +3272,11 @@ def run_adaptive_web(scan_id, targets, sid):
                     log(f"[Adaptive] Pulado: {task['reason']} — {job['url']}")
                     continue
             log(f"[Adaptive] {job['reason']}: {job['tool']} → {job['url']}")
+            run_id = (db_start_tool_run(scan_id, stage_id, job['tool'], url)
+                      if stage_id else None)
             raw, extracted = run_tool_sequential(scan_id, job['tool'], url, sid, context, task)
+            if run_id is not None:
+                db_finish_tool_run(run_id, task, task.get('output_path'))
             results[f"{job['tool']}::{index + 1}"] = {'raw': raw, 'targets': extracted}
             log(f"[Adaptive] {task['status']}: {job['tool']} — {task.get('reason', job['reason'])}")
         for error in report['errors']:
@@ -2985,10 +3310,11 @@ def targets_for_tool(tool_key, target_list):
             values = values[:1]
         elif tool_key in {'commix', 'nuclei_dast'}:
             values = [value for value in values if urlsplit(value).query]
-        elif tool_key == 'dalfox':
-            # Let Dalfox mine the application root once, then only revisit
-            # explicitly parameterized URLs.
-            values = values[:1] + [value for value in values[1:] if urlsplit(value).query]
+        elif tool_key in {'dalfox', 'dalfox_url'}:
+            # XSS scanners require a concrete query surface; pages and empty
+            # trailing '?' values have no URL parameter to test.
+            values = [value for value in values
+                      if parse_qsl(urlsplit(value).query, keep_blank_values=True)]
     elif input_type == 'host':
         values = [to_host(value) for value in target_list]
     elif input_type == 'domain':
@@ -3018,6 +3344,7 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     all_extracted = []
     stage_results = {}
     all_followups = []
+    tool_statuses = []
 
     # Filtragem por perfil de intensidade
     all_stage_tools = stage['tools']
@@ -3030,6 +3357,29 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
     else:
         tools_to_run = all_stage_tools
 
+    scan = active_scans.get(scan_id, {})
+    profile = scan.get('profile', 'standard')
+    findings_before = db_summary(scan_id).get('total', 0)
+    profile_config = PROFILE_CONFIG.get(profile, PROFILE_CONFIG['standard'])
+    if profile == 'passive':
+        excluded = [key for key in tools_to_run
+                    if 'passive' not in TOOLS.get(key, {}).get('tags', [])]
+        for key in excluded:
+            run_id = db_start_tool_run(scan_id, stage['id'], key, '')
+            db_finish_tool_run(run_id, {'status': 'skipped',
+                'reason': 'Desabilitada pelo perfil passive'})
+            tool_statuses.append('skipped')
+        tools_to_run = [key for key in tools_to_run
+                        if 'passive' in TOOLS.get(key, {}).get('tags', [])]
+    elif profile == 'deep':
+        # Deep raises per-tool timeout, while retaining sequential execution to
+        # avoid changing established tool concurrency and target ordering.
+        pass
+
+    operational_phase = stage.get('operational_phase') or (
+        'assessment' if stage.get('phase') == 'test' else 'discovery')
+    db_start_stage(scan_id, stage, operational_phase, len(target_list))
+
     socketio.emit('stage_start', {
         'scan_id':scan_id, 'stage_id':stage['id'],
         'stage_name':stage['name'], 'tools':tools_to_run,
@@ -3041,8 +3391,19 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
         if active_scans.get(scan_id, {}).get('cancelled'):
             break
         if tool_key == 'adaptive_web':
-            adaptive_results, _ = run_adaptive_web(scan_id, target_list, sid)
+            run_id = db_start_tool_run(scan_id, stage['id'], tool_key,
+                                       ', '.join(target_list[:5]))
+            adaptive_results, _ = run_adaptive_web(
+                scan_id, target_list, sid, stage_id=stage['id'])
             stage_results.update(adaptive_results)
+            report = active_scans.get(scan_id, {}).get('adaptive_report') or {}
+            gaps = len(report.get('errors', [])) + len(report.get('pending', [])) + sum(
+                1 for task in report.get('tasks', []) if task.get('status') in ('failed', 'skipped'))
+            adaptive_status = 'completed' if not gaps else 'completed_with_gaps'
+            outcome = {'status': adaptive_status,
+                       'reason': '' if not gaps else f'{gaps} item(ns) não concluído(s)'}
+            db_finish_tool_run(run_id, outcome)
+            tool_statuses.append(adaptive_status)
             continue
         
         wait_time = random.uniform(1.5, 4.2)
@@ -3050,11 +3411,33 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
 
         routed_targets = targets_for_tool(tool_key, target_list)
         if not routed_targets:
+            reason = 'Nenhum alvo compatível com o tipo de entrada da ferramenta'
+            run_id = db_start_tool_run(scan_id, stage['id'], tool_key, '')
+            db_finish_tool_run(run_id, {'status': 'skipped', 'reason': reason})
+            tool_statuses.append('skipped')
             socketio.emit('tool_skip', {'scan_id': scan_id, 'tool': tool_key,
-                'reason': 'Nenhum alvo compatível com o tipo de entrada da ferramenta'}, room=sid)
+                'reason': reason}, room=sid)
             continue
         for raw_target in routed_targets:
-            raw, extracted = run_tool_sequential(scan_id, tool_key, raw_target, sid)
+            policy = ScopePolicy.from_dict(scan.get('scope_policy'))
+            allowed, reason = policy.decision(raw_target)
+            if not allowed:
+                run_id = db_start_tool_run(scan_id, stage['id'], tool_key, raw_target)
+                db_finish_tool_run(run_id, {'status': 'skipped', 'reason': reason})
+                tool_statuses.append('skipped')
+                db_dispose_discoveries(scan_id, [raw_target], 'out_of_scope', reason)
+                socketio.emit('tool_skip', {'scan_id': scan_id, 'tool': tool_key,
+                    'reason': f'Bloqueado pelo escopo: {reason}', 'target': raw_target}, room=sid)
+                continue
+            run_id = db_start_tool_run(scan_id, stage['id'], tool_key, raw_target)
+            outcome = {}
+            raw, extracted = run_tool_sequential(
+                scan_id, tool_key, raw_target, sid, outcome=outcome)
+            db_finish_tool_run(run_id, outcome, outcome.get('output_path'))
+            core_store.record_tool(scan_id, stage['id'], tool_key, raw_target,
+                                   outcome.get('status', 'failed'), profile,
+                                   outcome.get('output_path'), outcome.get('reason', ''))
+            tool_statuses.append(outcome.get('status', 'failed'))
             key = f"{tool_key}::{raw_target}"
             stage_results[key] = {'raw': raw, 'targets': extracted}
             all_extracted.extend(extracted)
@@ -3066,12 +3449,30 @@ def run_stage(scan_id, stage, target_list, sid, intensity='full'):
         if t['value'] not in seen:
             seen.add(t['value']); unique.append(t)
 
+    db_record_discoveries(scan_id, stage['id'], unique)
+    if active_scans.get(scan_id, {}).get('cancelled'):
+        stage_status, detail = 'cancelled', 'Scan cancelada pelo operador'
+    elif tool_statuses and all(status == 'completed' for status in tool_statuses):
+        stage_status, detail = 'completed', ''
+    elif tool_statuses and all(status in ('failed', 'skipped') for status in tool_statuses):
+        stage_status = 'failed'
+        detail = 'Nenhuma execução planejada foi concluída'
+    else:
+        stage_status = 'completed_with_gaps'
+        detail = 'Há ferramentas ou alvos não concluídos; consulte o ledger'
+    finding_count = max(0, db_summary(scan_id).get('total', 0) - findings_before)
+    db_finish_stage(scan_id, stage['id'], stage_status, len(unique), detail,
+                    finding_count=finding_count)
+
     socketio.emit('stage_done', {
         'scan_id':scan_id, 'stage_id':stage['id'],
         'stage_name':stage['name'],
         'extracted_count':len(unique),
+        'finding_count': finding_count,
         'extracted_targets':unique,
         'manual_followups': list(set(all_followups)),
+        'status': stage_status,
+        'detail': detail,
     }, room=sid)
 
     return stage_results, unique
@@ -3134,7 +3535,12 @@ def pivot_expands_host(initial_target, pivots):
 def run_ai_pipeline(scan_id, sid):
     scan = active_scans[scan_id]
     config = scan['ai_config']
+    findings_before = db_summary(scan_id).get('total', 0)
     results = {}
+    ai_stage = {'id': 'ai_orchestration', 'name': 'Triagem orientada por IA',
+                'phase': 'test', 'operational_phase': 'assessment'}
+    db_start_stage(scan_id, ai_stage, 'assessment', len(config.get('seeds', [])))
+    ai_tool_statuses = []
 
     def emit_ai(event, data):
         socketio.emit(event, {'scan_id': scan_id, **data}, room=sid)
@@ -3167,15 +3573,34 @@ def run_ai_pipeline(scan_id, sid):
 
     def execute(tool, target):
         # Second validation at the execution boundary, independent of the model.
-        if tool not in ai_pipeline.CATALOG or tool == 'ai_manual' or scoped_url(config['seeds'][0], target) != target:
+        policy_data = scan.get('scope_policy')
+        in_policy_scope = (True if not policy_data else
+                           ScopePolicy.from_dict(policy_data).decision(target)[0])
+        if (tool not in ai_pipeline.CATALOG or tool == 'ai_manual'
+                or scoped_url(config['seeds'][0], target) != target or not in_policy_scope):
             raise ValueError('Ação fora do catálogo/escopo')
         outcome = {}
+        run_id = db_start_tool_run(scan_id, ai_stage['id'], tool, target)
         raw, _ = run_tool_sequential(scan_id, tool, target, sid, outcome=outcome)
+        db_finish_tool_run(run_id, outcome, outcome.get('output_path'))
+        ai_tool_statuses.append(outcome.get('status', 'failed'))
         results[str(len(results) + 1)] = {tool: {'raw': raw}}
         return raw, outcome
 
     report = ai_pipeline.run(config, decide, execute, approve, emit_ai, save,
                              lambda: scan.get('cancelled', False))
+    if scan.get('cancelled'):
+        stage_status, detail = 'cancelled', 'Scan cancelada pelo operador'
+    elif report.get('status') == 'failed' or (ai_tool_statuses and
+            all(status in ('failed', 'skipped') for status in ai_tool_statuses)):
+        stage_status, detail = 'failed', report.get('error', 'Nenhuma ação foi concluída')
+    elif ai_tool_statuses and all(status == 'completed' for status in ai_tool_statuses):
+        stage_status, detail = 'completed', ''
+    else:
+        stage_status, detail = 'completed_with_gaps', 'A triagem terminou com ações pendentes ou não concluídas'
+    finding_count = max(0, db_summary(scan_id).get('total', 0) - findings_before)
+    db_finish_stage(scan_id, ai_stage['id'], stage_status, 0, detail,
+                    finding_count=finding_count)
     _finish(scan_id, results, scan['target'], [], sid)
     status = 'cancelled' if scan.get('cancelled') else ('failed' if report['status'] == 'failed' else 'done')
     scan['status'] = status
@@ -3193,6 +3618,8 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
         index = next((i for i, s in enumerate(stages) if s.get('phase') == 'test'), len(stages))
         stages.insert(index, {'id': 'adaptive', 'name': 'Adaptive Web: formulários e parâmetros',
                               'phase': 'test', 'tools': ['adaptive_web']})
+    stages = [{**stage, 'operational_phase': operational_phase_for_stage(stage, index)}
+              for index, stage in enumerate(stages)]
     all_results = {}
     current_targets = [initial_target]
     all_followups = []
@@ -3221,6 +3648,8 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
                 auto_approve = (len(pivots) <= AUTO_CHECKPOINT_THRESHOLD and not scope_expansion)
 
                 if auto_approve:
+                    db_dispose_discoveries(scan_id, [item['value'] for item in pivots],
+                                           'consumed', 'Encaminhada automaticamente à próxima fase')
                     socketio.emit('checkpoint_auto', {
                         'scan_id': scan_id,
                         'after_stage': stage['id'],
@@ -3241,6 +3670,8 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
                     'all_results': all_results,
                     'all_followups': all_followups,
                 })
+                db_update_coverage(scan_id, stages[i + 1]['operational_phase'], 'blocked',
+                                   'Aguardando revisão dos pivôs descobertos')
                 socketio.emit('checkpoint', {
                     'scan_id': scan_id,
                     'after_stage': stage['id'],
@@ -3255,6 +3686,9 @@ def run_pipeline(scan_id, pipeline_def, initial_target, custom_stages, sid, inte
                 return
             # Sem novos pivôs: segue para o próximo estágio no(s) mesmo(s) alvo(s).
 
+    db_dispose_discoveries(scan_id, [row['value'] for row in db_operational_ledger(scan_id)['discoveries']
+                                    if row['disposition'] == 'pending'],
+                           'retained', 'Inventário final; nenhuma fase posterior consumiu este item')
     _finish(scan_id, all_results, initial_target, all_followups, sid)
 
 def run_pipeline_guarded(scan_id, pipeline_def, initial_target, custom_stages, sid, intensity='full'):
@@ -3279,6 +3713,17 @@ def run_pipeline_guarded(scan_id, pipeline_def, initial_target, custom_stages, s
                     pass
         try:
             db_finish_scan(scan_id, 'failed')
+            now = datetime.now().isoformat()
+            with _db_lock, _db() as c:
+                c.execute("UPDATE stage_runs SET status='failed',detail=?,finished_at=? "
+                          "WHERE scan_id=? AND status='running'",
+                          (message, now, scan_id))
+                c.execute("UPDATE tool_runs SET status='failed',reason=?,finished_at=? "
+                          "WHERE scan_id=? AND status='running'",
+                          (message, now, scan_id))
+            db_close_unreached_coverage(
+                scan_id, 'blocked', 'Pipeline interrompido por falha interna')
+            db_update_coverage(scan_id, 'reporting', 'failed', message)
         except (sqlite3.Error, OSError):
             pass
         socketio.emit('pipeline_error', {
@@ -3295,7 +3740,8 @@ def run_pipeline_guarded(scan_id, pipeline_def, initial_target, custom_stages, s
 
 def _finish(scan_id, all_results, target, followups, sid):
     ai_report = active_scans.get(scan_id, {}).get('ai_report')
-    completion_status = 'done'
+    completion_status = ('cancelled' if active_scans.get(scan_id, {}).get('cancelled')
+                         else 'done')
     if ai_report:
         completion_status = ('cancelled' if active_scans[scan_id].get('cancelled') else
                              ('failed' if ai_report.get('status') == 'failed' else 'done'))
@@ -3317,6 +3763,24 @@ def _finish(scan_id, all_results, target, followups, sid):
     # the guarded worker emits one explicit failed completion instead of leaving
     # a misleading successful scan in the browser.
     db_finish_scan(scan_id, completion_status)
+    finding_count = validation_candidate_count(db_summary(scan_id))
+    if completion_status == 'done':
+        db_close_unreached_coverage(
+            scan_id, 'not_applicable', 'A fase não foi planejada pelo pipeline selecionado')
+        if finding_count:
+            db_update_coverage(scan_id, 'validation', 'pending',
+                               f'{finding_count} candidato(s) aguardando validação/triagem')
+        else:
+            db_update_coverage(scan_id, 'validation', 'not_applicable',
+                               'Nenhum candidato gerado; isto não comprova ausência de vulnerabilidades')
+        db_update_coverage(scan_id, 'reporting', 'completed',
+                           'Resultados, cobertura e lacunas consolidados', str(result_file))
+    else:
+        db_close_unreached_coverage(
+            scan_id, completion_status,
+            'Fase não alcançada porque o pipeline não terminou normalmente')
+        db_update_coverage(scan_id, 'reporting', completion_status,
+                           'Pipeline não terminou normalmente')
     if scan_id in active_scans:
         active_scans[scan_id]['status'] = completion_status
 
@@ -3362,7 +3826,8 @@ def index():
     tools_s = {k: {**t, 'available': check_binary(t['binary'])} for k, t in TOOLS.items()}
     return render_template('index.html',
         tools_json=_safe_js_json(tools_s),
-        pipelines_json=_safe_js_json(PIPELINES),
+        pipelines_json=_safe_js_json(pipelines_for_ui()),
+        operational_phases_json=_safe_js_json(OPERATIONAL_PHASES),
         proxy_profiles_json=_safe_js_json(PROXY_PROFILES),
         manual_checklist_json=_safe_js_json(MANUAL_CHECKLIST),
     )
@@ -3645,6 +4110,34 @@ def api_export(scan_id):
 def api_scan_summary(scan_id):
     return jsonify(db_summary(scan_id))
 
+@app.route('/api/scan/<scan_id>/ledger')
+def api_scan_ledger(scan_id):
+    ledger = db_operational_ledger(scan_id)
+    if not ledger['scan']:
+        return jsonify({'error': 'Scan não encontrada'}), 404
+    return jsonify(ledger)
+
+def load_scan_assets(scan_id):
+    with _db_lock, _db() as c:
+        return [dict(row) for row in c.execute(
+            'SELECT atype,value,created_at FROM assets WHERE scan_id=? ORDER BY id', (scan_id,))]
+
+@app.route('/api/scan/<scan_id>/analysis')
+def api_scan_analysis(scan_id):
+    result_path = RESULTS_DIR / f'{scan_id}.json'
+    if not result_path.is_file():
+        return jsonify({'error': 'Scan não encontrada'}), 404
+    data = json.loads(result_path.read_text(encoding='utf-8'))
+    endpoints = analyze_attack_surface(data, load_scan_assets(scan_id))
+    for endpoint in endpoints:
+        value = endpoint.get('url') or endpoint.get('value')
+        if value:
+            core_store.upsert_asset(scan_id, 'endpoint', value,
+                                    {'wstg_tags': endpoint['wstg_tags'],
+                                     'priority_score': endpoint['priority_score']},
+                                    state='triaged')
+    return jsonify({'endpoints': endpoints})
+
 def _reverse_report(d):
     adaptive = d.get('adaptive_report') or {}
     report = adaptive.get('reverse_engineering') or {}
@@ -3791,6 +4284,13 @@ def api_report(scan_id):
     findings = db_findings(scan_id)
     summary  = db_summary(scan_id)
     fmt      = request.args.get('fmt', 'html')
+    if fmt == 'guide':
+        guide = build_analysis_guide(data, load_scan_assets(scan_id))
+        guide_path = RESULTS_DIR / scan_id / 'analysis_guide.md'
+        guide_path.parent.mkdir(parents=True, exist_ok=True)
+        guide_path.write_text(guide, encoding='utf-8')
+        return Response(guide, mimetype='text/markdown',
+            headers={'Content-Disposition': f'attachment; filename=analysis_guide_{scan_id}.md'})
     if fmt == 'md':
         md = build_markdown_report(data, findings, summary)
         return Response(md, mimetype='text/markdown',
@@ -4032,6 +4532,17 @@ def on_start(data):
     pipeline_key  = data.get('pipeline_key')
     custom_stages = data.get('custom_stages')
     sid = request.sid
+    profile = data.get('profile', os.environ.get('RECONX_PROFILE', 'standard'))
+    if profile not in PROFILE_CONFIG:
+        emit('error', {'message': 'Perfil inválido. Use passive, standard ou deep.'}); return
+    raw_policy = data.get('scope_policy') or DEFAULT_SCOPE_POLICY or {}
+    if not raw_policy and data.get('scope'):
+        raw_policy = {'in_scope': data.get('scope', []), 'out_of_scope': []}
+    try:
+        scope_policy = ScopePolicy.from_dict(raw_policy)
+        scope_policy.require(target)
+    except (ValueError, TypeError) as exc:
+        emit('error', {'message': str(exc)}); return
 
     if not target:
         emit('error', {'message': 'Alvo obrigatório'}); return
@@ -4054,8 +4565,8 @@ def on_start(data):
         emit('error', {'message': str(exc)}); return
 
     if pipeline_key in ('web_recon', 'api_recon'):
-        profile = host_store.get(host_id)
-        suggestion = next(s for s in profile['suggestions'] if s['key'] == pipeline_key)
+        host_profile = host_store.get(host_id)
+        suggestion = next(s for s in host_profile['suggestions'] if s['key'] == pipeline_key)
         if not suggestion['ready']:
             emit('error', {'message': f"Pipeline ainda não liberado: {suggestion['reason']}"}); return
 
@@ -4066,7 +4577,7 @@ def on_start(data):
         # Previously a readonly SQLite database raised out of the Socket.IO
         # handler, leaving the browser waiting forever without an error event.
         db_create_scan(scan_id, target, pipeline_def.get('label', 'Custom'),
-                       proxy_status().get('profile', 'none'))
+                       proxy_status().get('profile', 'none'), raw_policy, profile)
         host_store.ensure(target, scan_id)
     except (sqlite3.Error, OSError) as exc:
         emit('error', {'message': (
@@ -4079,6 +4590,7 @@ def on_start(data):
     active_scans[scan_id] = {
         'processes': {}, 'cancelled': False,
         'status': 'running', 'target': target, 'sid': sid, 'intensity': data.get('intensity', 'full'),
+        'profile': profile, 'scope_policy': raw_policy,
         'login_testing': login_config,
         'ai_config': ai_config,
         'approved_scope_targets': [target],
@@ -4103,37 +4615,23 @@ def on_start(data):
         })
 
     intensity = data.get('intensity', 'full')
+    if profile == 'passive':
+        intensity = 'stealth'
+    elif profile == 'deep':
+        intensity = 'full'
     threading.Thread(
-        target=run_pipeline_guarded,
+        target=run_pipeline_limited,
         args=(scan_id, pipeline_def, target, custom_stages, sid, intensity),
         daemon=True
     ).start()
 
 def _in_scope(value, scope_list):
-    """Verifica se um valor (host/IP/URL) está dentro do escopo definido."""
-    if not scope_list:
-        return True  # sem escopo = tudo permitido
-    import ipaddress, urllib.parse
-    val = value.strip().lower()
-    parsed = urllib.parse.urlparse(val if '://' in val else f'http://{val}')
-    host = parsed.hostname or val
-    for s in scope_list:
-        s = s.strip().lower()
-        try:
-            # CIDR match
-            net = ipaddress.ip_network(s, strict=False)
-            try:
-                if ipaddress.ip_address(host) in net:
-                    return True
-                continue
-            except ValueError:
-                pass
-        except ValueError:
-            pass
-        # Domínio / sufixo
-        if host == s or host.endswith('.' + s):
-            return True
-    return False
+    """Compatibilidade com a UI antiga, delegando a decisão ao core."""
+    return ScopePolicy(in_scope=list(scope_list or [])).decision(value)[0]
+
+def run_pipeline_limited(*args):
+    with _scan_semaphore:
+        return run_pipeline_guarded(*args)
 
 @socketio.on('ai_action_response')
 def on_ai_action_response(data):
@@ -4150,22 +4648,32 @@ def on_approve(data):
     if active_scans.get(scan_id, {}).get('ai_config'):
         emit('error', {'message': 'Use a aprovação específica da ação IA'}); return
     approved = data.get('approved_targets', [])
-    scope    = data.get('scope', [])
+    scope_policy = data.get('scope_policy')
+    scope = data.get('scope', [])
     sid = request.sid
 
     # Scope validation: sinalizar targets fora do escopo
-    if scope:
-        out_of_scope = [t for t in approved if not _in_scope(t, scope)]
+    if scope_policy or scope:
+        policy = ScopePolicy.from_dict(scope_policy or {'in_scope': scope})
+        out_of_scope = [t for t in approved if not policy.decision(t)[0]]
         if out_of_scope:
+            db_dispose_discoveries(scan_id, out_of_scope, 'out_of_scope',
+                                   'Removida por não pertencer ao escopo informado')
             emit('scope_warning', {
                 'scan_id': scan_id,
                 'out_of_scope': out_of_scope,
                 'message': f'{len(out_of_scope)} target(s) fora do escopo definido',
             })
-            approved = [t for t in approved if _in_scope(t, scope)]
+            approved = [t for t in approved if policy.decision(t)[0]]
 
     scan = active_scans.get(scan_id)
     if not scan: emit('error', {'message': 'Scan não encontrado'}); return
+
+    pending_values = [item.get('value') for item in scan.get('pending_targets', [])]
+    db_dispose_discoveries(scan_id, approved, 'consumed',
+                           'Aprovada pelo operador e encaminhada à próxima fase')
+    db_dispose_discoveries(scan_id, [value for value in pending_values if value not in approved],
+                           'not_approved', 'Não aprovada pelo operador no checkpoint')
 
     remaining    = scan.get('remaining_stages', [])
     all_results  = scan.get('all_results', {})
@@ -4176,6 +4684,9 @@ def on_approve(data):
         if to_url(target) and target not in approved_scope:
             approved_scope.append(target)
     scan['status'] = 'running'
+    if remaining:
+        db_update_coverage(scan_id, remaining[0].get('operational_phase', 'discovery'),
+                           'planned', 'Checkpoint aprovado; fase liberada')
 
     emit('checkpoint_resumed', {
         'scan_id': scan_id, 'approved_count': len(approved),
@@ -4199,6 +4710,9 @@ def on_approve(data):
                     scan.update({'status':'checkpoint','remaining_stages':remaining[i+1:],
                         'all_results':all_results,'all_followups':all_followups,
                         'pending_targets':pivots})
+                    db_update_coverage(scan_id,
+                        remaining[i + 1].get('operational_phase', 'discovery'), 'blocked',
+                        'Aguardando revisão dos pivôs descobertos')
                     socketio.emit('checkpoint', {
                         'scan_id':scan_id,'after_stage':stage['id'],
                         'after_stage_name':stage['name'],
@@ -4208,6 +4722,10 @@ def on_approve(data):
                     }, room=sid)
                     return
                 # Sem novos pivôs: mantém os mesmos alvos no próximo estágio.
+        db_dispose_discoveries(scan_id,
+            [row['value'] for row in db_operational_ledger(scan_id)['discoveries']
+             if row['disposition'] == 'pending'], 'retained',
+            'Inventário final; nenhuma fase posterior consumiu este item')
         _finish(scan_id, all_results, initial_target, all_followups, sid)
 
     threading.Thread(target=resume, daemon=True).start()
@@ -4225,6 +4743,43 @@ def on_cancel(data):
             except: pass
         emit('scan_cancelled', {'scan_id': scan_id})
 
+def resume_scan(scan_id):
+    """Re-run only interrupted/failed/skipped tool-target pairs for one scan."""
+    ledger = db_operational_ledger(scan_id)
+    if not ledger['scan']:
+        raise ValueError(f'Scan não encontrada: {scan_id}')
+    scan_row = ledger['scan']
+    policy_data = json.loads(scan_row.get('scope_json') or '{}')
+    policy = ScopePolicy.from_dict(policy_data)
+    pending = [row for row in ledger['tool_runs']
+               if row['status'] in ('running', 'failed', 'skipped', 'cancelled')]
+    if not pending:
+        return {'scan_id': scan_id, 'resumed': 0, 'message': 'Nenhuma execução pendente'}
+    active_scans[scan_id] = {
+        'target': scan_row['target'], 'processes': {}, 'cancelled': False,
+        'status': 'running', 'profile': scan_row.get('profile', 'standard'),
+        'scope_policy': policy_data, 'approved_scope_targets': [scan_row['target']],
+    }
+    resumed = 0
+    for row in pending:
+        if row['tool'] not in TOOLS:
+            continue
+        allowed, reason = policy.decision(row.get('target') or scan_row['target'])
+        if not allowed:
+            db_finish_tool_run(row['id'], {'status': 'skipped', 'reason': reason})
+            continue
+        outcome = {}
+        raw, assets = run_tool_sequential(scan_id, row['tool'], row['target'], '', outcome=outcome)
+        db_finish_tool_run(row['id'], outcome, outcome.get('output_path'))
+        core_store.record_tool(scan_id, row['stage_id'], row['tool'], row['target'],
+                               outcome.get('status', 'failed'), active_scans[scan_id]['profile'],
+                               outcome.get('output_path'), outcome.get('reason', ''))
+        if assets:
+            db_record_discoveries(scan_id, row['stage_id'], assets)
+        resumed += 1
+    active_scans[scan_id]['status'] = 'done'
+    return {'scan_id': scan_id, 'resumed': resumed}
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="ReconX v5 — orquestrador de pentest")
     parser.add_argument('--host', default='127.0.0.1',
@@ -4233,7 +4788,49 @@ if __name__ == '__main__':
     parser.add_argument('--expose', action='store_true',
         help="Expoe na rede local (0.0.0.0) — use com cautela")
     parser.add_argument('--debug', action='store_true', help="Modo debug do Flask")
+    parser.add_argument('--profile', choices=tuple(PROFILE_CONFIG),
+        default=os.environ.get('RECONX_PROFILE', 'standard'),
+        help='Perfil padrão para scans iniciados pela interface')
+    parser.add_argument('--scope', action='append', default=[],
+        help='Regra in_scope padrão (domínio, wildcard ou CIDR); pode repetir')
+    parser.add_argument('--out-of-scope', action='append', default=[],
+        help='Exclusão explícita de escopo; pode repetir')
+    parser.add_argument('--resume', metavar='SCAN_ID',
+        help='Retoma execuções interrompidas/fracassadas registradas para um scan')
+    parser.add_argument('--analyze', metavar='SCAN_ID',
+        help='Gera analysis_guide.md offline para um scan existente')
+    parser.add_argument('--export-jsonl', metavar='SCAN_ID',
+        help='Exporta ativos normalizados de uma scan em JSONL')
+    parser.add_argument('--export-txt', metavar='SCAN_ID',
+        help='Exporta ativos normalizados de uma scan em texto tabulado')
     args = parser.parse_args()
+
+    DEFAULT_SCOPE_POLICY = {'in_scope': args.scope, 'out_of_scope': args.out_of_scope}
+    if args.resume:
+        print(json.dumps(resume_scan(args.resume), ensure_ascii=False))
+        raise SystemExit(0)
+    if args.analyze:
+        result_path = RESULTS_DIR / f'{args.analyze}.json'
+        if not result_path.is_file():
+            parser.error(f'Scan não encontrada: {args.analyze}')
+        scan_data = json.loads(result_path.read_text(encoding='utf-8'))
+        guide = build_analysis_guide(scan_data, load_scan_assets(args.analyze))
+        guide_path = RESULTS_DIR / args.analyze / 'analysis_guide.md'
+        guide_path.parent.mkdir(parents=True, exist_ok=True)
+        guide_path.write_text(guide, encoding='utf-8')
+        print(guide_path)
+        raise SystemExit(0)
+    if args.export_jsonl or args.export_txt:
+        scan_id = args.export_jsonl or args.export_txt
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', scan_id):
+            parser.error('SCAN_ID inválido')
+        suffix = 'jsonl' if args.export_jsonl else 'txt'
+        output = RESULTS_DIR / f'{scan_id}.assets.{suffix}'
+        count = (core_store.export_jsonl(scan_id, output) if args.export_jsonl
+                 else core_store.export_txt(scan_id, output))
+        print(f'{output} ({count} ativos)')
+        raise SystemExit(0)
+    os.environ['RECONX_PROFILE'] = args.profile
 
     host = '0.0.0.0' if args.expose else args.host
     print(f"[*] ReconX v5 — {host}:{args.port}")

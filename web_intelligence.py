@@ -646,8 +646,21 @@ def discover(initial_url, fetch, seeds=(), max_pages=12, max_depth=2, cancelled=
     if not initial_url:
         raise ValueError('Alvo HTTP(S) inválido')
     queue = deque([(initial_url, 0)])
-    queue.extend((u, 0) for s in seeds
-                 if (u := application_url(initial_url, s, allowed_paths)))
+    # This API receives URL/path pivots, not the host strings also carried by
+    # ReconX between stages. Treating a bare hostname as a relative URL creates
+    # paths such as `/sispatio.com.br` and wastes a request on a predictable 404.
+    for seed in seeds:
+        value = str(seed or '').strip()
+        if not value:
+            continue
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            continue
+        if parsed.scheme.lower() not in ('http', 'https') and not value.startswith('/'):
+            continue
+        if candidate := application_url(initial_url, value, allowed_paths):
+            queue.append((candidate, 0))
     seen, pages, errors = set(), [], []
     while queue and len(seen) < max_pages and not cancelled():
         url, depth = queue.popleft()

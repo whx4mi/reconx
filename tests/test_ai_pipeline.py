@@ -241,7 +241,11 @@ class AiPipelineTests(unittest.TestCase):
             ns = {'active_scans': {'scan': scan}, 'ai_pipeline': ai, 'json': json,
                   'active_proxy': {'profile': 'none'}, '_proxy_url_if_alive': MagicMock(),
                   '_scan_output_dir': lambda s: Path(work), 'scoped_url': ai.scoped_url,
-                  '_finish': MagicMock(), 'db_finish_scan': MagicMock()}
+                  '_finish': MagicMock(), 'db_finish_scan': MagicMock(),
+                  'db_summary': MagicMock(return_value={'total': 0}),
+                  'db_start_stage': MagicMock(), 'db_finish_stage': MagicMock(),
+                  'db_start_tool_run': MagicMock(return_value=1),
+                  'db_finish_tool_run': MagicMock()}
             def socket_emit(event, data, room):
                 self.assertEqual(room, 'owner')
                 if event == 'ai_approval_required':

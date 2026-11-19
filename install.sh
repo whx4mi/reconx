@@ -111,7 +111,8 @@ echo ""
 
 # ── Cria estrutura ─────────────────────────────────────────────────
 info "Criando estrutura de diretórios..."
-mkdir -p "$APP_DIR/templates" "$RESULTS_DIR/sqlmap" "$RESULTS_DIR/screenshots" "$RESULTS_DIR/.tmp"
+mkdir -p "$APP_DIR/templates" "$APP_DIR/wordlists" "$RESULTS_DIR/sqlmap" \
+    "$RESULTS_DIR/screenshots" "$RESULTS_DIR/.tmp"
 chmod 700 "$RESULTS_DIR/.tmp"
 # Compiladores Go e outras ferramentas também precisam escapar de /tmp pequeno.
 export TMPDIR="$RESULTS_DIR/.tmp"
@@ -126,6 +127,13 @@ cp "$SCRIPT_DIR/login_testing.py"         "$APP_DIR/login_testing.py"
 cp "$SCRIPT_DIR/ai_pipeline.py"           "$APP_DIR/ai_pipeline.py"
 cp "$SCRIPT_DIR/gemini_client.py"         "$APP_DIR/gemini_client.py"
 cp "$SCRIPT_DIR/host_profiles.py"         "$APP_DIR/host_profiles.py"
+mkdir -p "$APP_DIR/core"
+cp "$SCRIPT_DIR/core/__init__.py"        "$APP_DIR/core/__init__.py"
+cp "$SCRIPT_DIR/core/scope.py"           "$APP_DIR/core/scope.py"
+cp "$SCRIPT_DIR/core/storage.py"         "$APP_DIR/core/storage.py"
+cp "$SCRIPT_DIR/core/analyzer.py"        "$APP_DIR/core/analyzer.py"
+cp "$SCRIPT_DIR/core/reporter.py"        "$APP_DIR/core/reporter.py"
+cp "$SCRIPT_DIR/wordlists/web-extension-candidates.txt" "$APP_DIR/wordlists/web-extension-candidates.txt"
 cp "$SCRIPT_DIR/templates/index.html"     "$APP_DIR/templates/index.html"
 cp "$SCRIPT_DIR/templates/host.html"      "$APP_DIR/templates/host.html"
 if [[ -f "$SCRIPT_DIR/update.sh" ]]; then

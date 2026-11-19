@@ -130,6 +130,12 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
 
 /* Steps */
 .step-list{padding:5px}
+.phase-group{margin:8px 2px 5px;padding:7px 6px;border-top:1px solid var(--b1)}
+.phase-group:first-child{margin-top:0;border-top:0}
+.phase-group b{display:block;color:var(--c);font-family:var(--sans);font-size:10px}
+.phase-group span{display:block;margin-top:2px;color:var(--mu2);font-size:8px;line-height:1.35}
+.phase-future{margin:7px;padding:8px;border:1px dashed var(--b2);border-radius:5px;background:rgba(189,147,249,.04)}
+.phase-future b{display:block;color:var(--p);font-size:9px}.phase-future span{display:block;margin-top:3px;color:var(--mu2);font-size:8px;line-height:1.4}
 .step-item{display:flex;align-items:flex-start;gap:7px;padding:6px 7px;
   border-radius:4px;margin-bottom:2px;border:1px solid transparent;transition:.1s}
 .step-item:hover{background:var(--bg3)}
@@ -226,6 +232,23 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
 .cov-pct{font-size:9px;color:var(--mu2)}
 .cov-body{padding:10px 14px;display:none}
 .cov-body.open{display:block}
+.ledger-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:7px;margin-bottom:12px}
+.ledger-card{background:var(--bg2);border:1px solid var(--b1);border-radius:7px;padding:10px}
+.ledger-card.running{border-color:rgba(0,212,255,.4)}
+.ledger-card.completed{border-color:rgba(0,255,136,.32)}
+.ledger-card.completed_with_gaps,.ledger-card.pending,.ledger-card.blocked{border-color:rgba(255,184,108,.4)}
+.ledger-card.failed,.ledger-card.cancelled{border-color:rgba(255,85,85,.45)}
+.ledger-phase{font-family:var(--sans);font-size:11px;color:var(--tx);margin-bottom:5px}
+.ledger-status{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--mu2)}
+.ledger-card.completed .ledger-status{color:var(--g)}
+.ledger-card.running .ledger-status{color:var(--c)}
+.ledger-card.completed_with_gaps .ledger-status,.ledger-card.pending .ledger-status,.ledger-card.blocked .ledger-status{color:var(--o)}
+.ledger-card.failed .ledger-status,.ledger-card.cancelled .ledger-status{color:var(--r)}
+.ledger-reason{font-size:9px;color:var(--mu2);line-height:1.4;margin-top:5px}
+.ledger-detail{background:var(--bg2);border:1px solid var(--b1);border-radius:7px;padding:10px;margin-bottom:12px}
+.ledger-row{display:grid;grid-template-columns:minmax(100px,1fr) 90px minmax(120px,2fr);gap:8px;
+  border-top:1px solid var(--b1);padding:6px 0;font-size:9px;align-items:start}
+.ledger-row:first-child{border-top:0}.ledger-target{color:var(--mu2);word-break:break-all}
 .check-item{display:flex;align-items:flex-start;gap:8px;padding:5px 0;
   border-bottom:1px solid var(--b1);cursor:pointer}
 .check-item:last-child{border-bottom:none}
@@ -436,15 +459,18 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
   </div>
 
   <!-- Target + Scope -->
-  <div class="sb-sec">
-    <div class="sb-hd">Alvo</div>
+  <details class="sb-sec" open>
+    <summary class="sb-hd" style="cursor:pointer">Alvos e escopo</summary>
     <div class="tgt-wrap">
-      <input class="tgt-in" id="tgt"
-        placeholder="domain.com | 10.10.10.1 | http://..." oninput="updateRunBtn()">
-      <input class="tgt-in" id="scope" style="margin-top:5px;font-size:10px"
-        placeholder="Escopo (opcional): 10.0.0.0/8, example.com">
+      <textarea class="proxy-input" id="targets" rows="3" oninput="updateRunBtn()"
+        placeholder="Um alvo por linha&#10;https://app.example.com/sistema/&#10;api.example.com"></textarea>
+      <div class="proxy-tip">Cada alvo recebe um scan independente. Até 10 alvos por lote; até 3 pipelines executam simultaneamente.</div>
+      <input class="proxy-input" id="scope-in" placeholder="Incluir (opcional): example.com, 10.0.0.0/8">
+      <input class="proxy-input" id="scope-out" placeholder="Excluir (opcional): admin.example.com, 10.0.0.8">
+      <div class="proxy-tip">Sem inclusões, cada scan fica limitado ao domínio do próprio alvo. Exclusões sempre prevalecem.</div>
+      <input type="hidden" id="scope" value="">
     </div>
-  </div>
+  </details>
 
   <details class="sb-sec" style="max-height:310px;overflow:auto">
     <summary class="sb-hd" style="cursor:pointer">Pipeline orientado por IA</summary>
@@ -511,7 +537,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
 
   <!-- Steps -->
   <div class="sb-sec" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
-    <div class="sb-hd">Passos
+    <div class="sb-hd">Fases e testes
       <span id="step-count" style="color:var(--mu);font-size:9px">0</span>
     </div>
     <div class="sb-scroll">
@@ -574,6 +600,9 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
   <!-- COVERAGE PANEL -->
   <div class="panel" id="panel-coverage">
     <div class="cov-wrap" id="cov-wrap">
+      <div id="operational-ledger">
+        <div class="empty" style="padding:18px"><div class="et">Conclua ou abra uma scan para ver a cobertura operacional.</div></div>
+      </div>
       <div style="font-size:11px;color:var(--mu2);margin-bottom:12px;line-height:1.6">
         Checklist de testes manuais — marque conforme for testando no Burp/ZAP.
         O automático cobre <span style="color:var(--o)">~30%</span> da superfície real.
@@ -667,12 +696,14 @@ body{background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px
 <!-- DATA INJECTION (safe JSON) -->
 <script type="application/json" id="_tools">{{ tools_json | safe }}</script>
 <script type="application/json" id="_pipes">{{ pipelines_json | safe }}</script>
+<script type="application/json" id="_phases">{{ operational_phases_json | safe }}</script>
 <script type="application/json" id="_proxies">{{ proxy_profiles_json | safe }}</script>
 <script type="application/json" id="_checklist">{{ manual_checklist_json | safe }}</script>
 
 <script>
 const TOOLS     = JSON.parse(document.getElementById('_tools').textContent);
 const PIPELINES = JSON.parse(document.getElementById('_pipes').textContent);
+const PHASES    = JSON.parse(document.getElementById('_phases').textContent);
 const PROXIES   = JSON.parse(document.getElementById('_proxies').textContent);
 const CHECKLIST = JSON.parse(document.getElementById('_checklist').textContent);
 
@@ -681,12 +712,14 @@ const CHECKLIST = JSON.parse(document.getElementById('_checklist').textContent);
 // ═══════════════════════════════════════════════════════════════════
 const S = {
   steps: [], selectedPreset: null, scanId: null,
+  activeScanIds: new Set(),
   running: false, total: 0, done: 0,
   checkpointData: null, cpSelected: new Set(),
   followups: [], checkProgress: {},
   proxyShown: false, selectedProxy: 'none',
-  findings: [], findSummary: null, actionItems: null,
+  findings: [], findSummary: null, actionItems: null, ledger: null,
 };
+const tracksScan = d => !d?.scan_id || S.activeScanIds.has(d.scan_id);
 
 // ═══════════════════════════════════════════════════════════════════
 // SOCKET
@@ -712,8 +745,10 @@ socket.on('proxy_warning', d => {
 
 socket.on('pipeline_started', d => {
   loadHosts();
-  S.scanId = d.scan_id; S.lastScanId = d.scan_id; S.running = true; S.total = 0; S.done = 0;
-  S.findings = []; S.findSummary = null; S.actionItems = null; renderFindings(); updateFindBadge();
+  const firstActive = S.activeScanIds.size === 0;
+  S.activeScanIds.add(d.scan_id);
+  S.scanId = d.scan_id; S.lastScanId = d.scan_id; S.running = true;
+  if (firstActive) { S.total = 0; S.done = 0; S.findings = []; S.findSummary = null; S.actionItems = null; S.ledger = null; renderFindings(); updateFindBadge(); }
   document.getElementById('stop-btn').style.display = '';
   document.getElementById('run-btn').disabled = true;
   document.getElementById('tinfo').textContent = `scan ${d.scan_id} — ${d.target}`;
@@ -738,6 +773,7 @@ socket.on('findings_summary', d => {
 });
 
 socket.on('stage_start', d => {
+  if (!tracksScan(d)) return;
   tlog('','');
   tlog('lc', `  ┌─ ${d.stage_name.toUpperCase()}`);
   tlog('lm', `  │  ${d.tools.join(' → ')}`);
@@ -745,6 +781,7 @@ socket.on('stage_start', d => {
 });
 
 socket.on('tool_start', d => {
+  if (!tracksScan(d)) return;
   S.total++;
   updateStep(S.done, 'running');
   tlog('','');
@@ -764,6 +801,7 @@ socket.on('tool_start', d => {
 });
 
 socket.on('tool_output', d => {
+  if (!tracksScan(d)) return;
   const l = d.line;
   let cls = 'lt';
   if (/error|exception|fail|denied|refused/i.test(l)) cls = 'lr';
@@ -774,12 +812,18 @@ socket.on('tool_output', d => {
 });
 
 socket.on('tool_done', d => {
+  if (!tracksScan(d)) return;
   S.done++;
-  const ok = d.success === true || (d.success === undefined && d.exit_code === 0);
+  const ok = d.status ? d.status === 'completed' :
+    (d.success === true || (d.success === undefined && d.exit_code === 0));
   updateStep(S.done - 1, ok ? 'done' : 'warn');
   setProgress((S.done / Math.max(S.total, 1)) * 80);
   const b = document.createElement('div');
-  b.innerHTML = `    <span class="badge ${ok?'b-ok':'b-warn'}">${ok?'✓':'!'} ${d.elapsed}s · ${d.lines} linhas</span>`;
+  const gap = d.status === 'completed_with_gaps' && d.reason ? ` · ${d.reason}` : '';
+  const badge = document.createElement('span');
+  badge.className = `badge ${ok?'b-ok':'b-warn'}`;
+  badge.textContent = `${ok?'✓':'!'} ${d.elapsed}s · ${d.lines} linhas${gap}`;
+  b.appendChild(badge);
   document.getElementById('tbody').appendChild(b);
   scrollTerm();
   // Accumulate followups
@@ -787,6 +831,7 @@ socket.on('tool_done', d => {
 });
 
 socket.on('tool_skip', d => {
+  if (!tracksScan(d)) return;
   const b = document.createElement('div');
   b.innerHTML = `    <span class="badge b-skip">⊘ ${d.tool} — ${d.reason}</span>`;
   document.getElementById('tbody').appendChild(b);
@@ -794,26 +839,30 @@ socket.on('tool_skip', d => {
 });
 
 socket.on('stage_done', d => {
-  tlog('lg', `  [✓] ${d.stage_name} — ${d.extracted_count} targets extraídos`);
+  if (!tracksScan(d)) return;
+  const complete = d.status === 'completed';
+  tlog(complete ? 'lg' : 'lo',
+    `  [${complete ? '✓' : '!'}] ${d.stage_name} — ${d.extracted_count} alvos/pivôs; ${d.finding_count || 0} achados novos${d.detail ? ` · ${d.detail}` : ''}`);
   if (d.manual_followups) S.followups.push(...d.manual_followups);
 });
 
 socket.on('checkpoint_auto', d => {
+  if (!tracksScan(d)) return;
   tlog('lg', `  [⚡] AUTO-CHECKPOINT — ${d.reason}`);
   tlog('lg', `  [→] Continuando para: ${d.next_stage} com ${d.approved_count} targets`);
 });
 
 let pendingAiAction = null;
 socket.on('ai_decision', d => {
-  if (d.scan_id !== S.scanId) return;
+  if (!tracksScan(d)) return;
   tlog('lp', `[IA] ${d.summary}`);
   tlog('lc', `[IA] ${d.reason} — evidência: ${d.evidence || 'não informada'}`);
 });
 socket.on('ai_error', d => {
-  if (d.scan_id === S.scanId) tlog('lo', `[IA interrompida] ${d.message}`);
+  if (tracksScan(d)) tlog('lo', `[IA interrompida] ${d.message}`);
 });
 socket.on('ai_approval_required', d => {
-  if (d.scan_id !== S.scanId) return;
+  if (!tracksScan(d)) return;
   pendingAiAction = d;
   document.getElementById('ai-approval-text').textContent =
     `Ferramenta: ${d.tool}\nAlvo: ${d.target}\nImpacto: ${d.impact}\nPrazo: ${Math.round(d.expires_in / 60)} minutos\n\nMotivo: ${d.reason}\nEvidência: ${d.evidence}\n\nResumo: ${d.summary}`;
@@ -844,6 +893,7 @@ function respondAiAction(approved) {
 }
 
 socket.on('checkpoint', d => {
+  if (!tracksScan(d)) return;
   tlog('','');
   tlog('lo','━'.repeat(58));
   tlog('lo', `  ⚠  CHECKPOINT — ${d.after_stage_name}`);
@@ -854,33 +904,45 @@ socket.on('checkpoint', d => {
 });
 
 socket.on('checkpoint_resumed', d => {
+  if (!tracksScan(d)) return;
   hideCheckpoint();
   tlog('lg', `  [✓] Checkpoint aprovado — ${d.approved_count} targets → ${d.next_stage}`);
   setRunSt('Continuando...');
 });
 
 socket.on('scope_warning', d => {
+  if (!tracksScan(d)) return;
   tlog('lo', `  [⚠] ESCOPO: ${d.message}`);
   toast('Targets fora do escopo removidos','warn');
 });
 
 socket.on('pipeline_complete', d => {
   loadHosts();
-  if (d.scan_id !== S.scanId && d.scan_id !== S.lastScanId) return;
-  S.running = false; S.scanId = null;
-  setProgress(100);
-  document.getElementById('stop-btn').style.display = 'none';
-  document.getElementById('run-btn').disabled = false;
-  document.getElementById('tinfo').textContent = 'reconx — concluído';
-  setRunSt('');
+  if (!S.activeScanIds.has(d.scan_id)) return;
+  S.activeScanIds.delete(d.scan_id);
+  S.running = S.activeScanIds.size > 0;
+  S.scanId = S.activeScanIds.size ? [...S.activeScanIds].at(-1) : null;
+  if (!S.running) {
+    setProgress(100);
+    document.getElementById('stop-btn').style.display = 'none';
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('tinfo').textContent = 'reconx — lote concluído';
+    setRunSt('');
+  } else {
+    setRunSt(`${S.activeScanIds.size} scan(s) ainda em execução`);
+  }
   tlog('','');
   tlog('lm','═'.repeat(58));
-  tlog(d.status === 'failed' ? 'lo' : 'lg', d.status === 'failed' ? '[!] SCAN INTERROMPIDA POR FALHA' : '[✓] SCAN FINALIZADA');
+  const terminalOk = d.status === 'done';
+  const terminalLabel = d.status === 'failed' ? '[!] SCAN INTERROMPIDA POR FALHA' :
+    (d.status === 'cancelled' ? '[!] SCAN CANCELADA' : '[✓] SCAN FINALIZADA');
+  tlog(terminalOk ? 'lg' : 'lo', terminalLabel);
   tlog('lm','═'.repeat(58));
-  toast(d.status === 'failed' ? 'Scan interrompida; veja o erro no terminal' : 'Scan finalizada', d.status === 'failed' ? 'warn' : 'ok');
+  toast(d.status === 'failed' ? 'Scan interrompida; veja o erro no terminal' :
+    (d.status === 'cancelled' ? 'Scan cancelada' : 'Scan finalizada'), terminalOk ? 'ok' : 'warn');
   // Load action items (auto-muda para aba Ação se tiver imediatos)
   const finishedId = d.scan_id || S.scanId;
-  if (finishedId) loadActionItems(finishedId);
+  if (finishedId) { loadActionItems(finishedId); loadOperationalLedger(finishedId); }
   // Update coverage tab with followups
   if (d.manual_followups) S.followups.push(...d.manual_followups);
   S.followups = [...new Set(S.followups)];
@@ -890,17 +952,15 @@ socket.on('pipeline_complete', d => {
 });
 
 socket.on('pipeline_error', d => {
-  if (d.scan_id !== S.scanId && d.scan_id !== S.lastScanId) return;
+  if (!tracksScan(d)) return;
   tlog('lr', `[!] ${d.message || 'Falha interna no pipeline'}`);
   toast('Pipeline interrompido; consulte o terminal', 'warn');
 });
 
-socket.on('scan_cancelled', () => {
+socket.on('scan_cancelled', d => {
+  if (!tracksScan(d)) return;
   pendingAiAction = null;
   document.getElementById('ai-approval-overlay').style.display = 'none';
-  S.running = false; S.scanId = null;
-  document.getElementById('stop-btn').style.display = 'none';
-  document.getElementById('run-btn').disabled = false;
   setRunSt(''); hideCheckpoint();
   tlog('lo','[!] Scan cancelada');
   toast('Cancelado','warn');
@@ -1007,8 +1067,12 @@ function closePipeMenu() {
 
 function selectPreset(key) {
   S.selectedPreset = key;
-  S.steps = PIPELINES[key].stages.flatMap(stage =>
-    stage.tools.map(t => ({ tool: t, note: TOOLS[t]?.desc || '' }))
+  S.steps = PIPELINES[key].stages.flatMap((stage, stageIndex) =>
+    stage.tools.map(t => ({
+      tool: t, note: TOOLS[t]?.desc || '', stageId: stage.id,
+      stageName: stage.name, operationalPhase: stage.operational_phase,
+      stageIndex,
+    }))
   );
   renderPipelines();
   renderSteps();
@@ -1023,12 +1087,18 @@ function renderSteps() {
     el.innerHTML = '<div style="padding:10px;font-size:10px;color:var(--mu);text-align:center">Selecione um pipeline ou adicione ferramentas</div>';
     return;
   }
+  let previousPhase = null;
   el.innerHTML = S.steps.map((s, i) => {
     const t = TOOLS[s.tool];
     if (!t) return '';
+    const phaseKey = s.operationalPhase || (t.phase === 'test' ? 'assessment' : 'discovery');
+    const phase = PHASES[phaseKey] || {order:'·',label:'Personalizado',objective:'Etapa selecionada pelo operador.'};
+    const phaseHeader = phaseKey !== previousPhase
+      ? `<div class="phase-group"><b>${phase.order}. ${phase.label}</b><span>${phase.objective}</span></div>` : '';
+    previousPhase = phaseKey;
     const ph = t.phase === 'recon' ? 'ph-recon' : 'ph-test';
     const av = t.available ? '' : 'style="opacity:.4"';
-    return `<div class="step-item" id="si-${i}" ${av}>
+    return `${phaseHeader}<div class="step-item" id="si-${i}" ${av}>
       <div class="sn" id="sn-${i}">${i+1}</div>
       <div class="sb">
         <div class="sl">${t.label}</div>
@@ -1037,14 +1107,15 @@ function renderSteps() {
       </div>
       <div class="sdel" onclick="removeStep(${i})">✕</div>
     </div>`;
-  }).join('');
+  }).join('') + `<div class="phase-future"><b>4. ${PHASES.validation.label}</b><span>${PHASES.validation.objective} Candidatos ficam na aba Findings até terem um resultado explícito.</span></div><div class="phase-future"><b>5. ${PHASES.reporting.label}</b><span>${PHASES.reporting.objective}</span></div>`;
 }
 
 function addTool() {
   const key = document.getElementById('add-sel').value;
   if (!key) return;
   S.selectedPreset = null;
-  S.steps.push({ tool: key, note: TOOLS[key]?.desc || '' });
+  S.steps.push({ tool: key, note: TOOLS[key]?.desc || '',
+    operationalPhase: TOOLS[key]?.phase === 'test' ? 'assessment' : 'discovery' });
   renderPipelines(); renderSteps(); updateRunBtn();
 }
 
@@ -1099,8 +1170,12 @@ function markAllDone() {
 // SCAN CONTROL
 // ═══════════════════════════════════════════════════════════════════
 function startScan() {
-  const target = document.getElementById('tgt').value.trim();
-  if (!target || !S.steps.length || S.running) return;
+  const targets = [...new Set(document.getElementById('targets').value.split(/\r?\n/).map(t=>t.trim()).filter(Boolean))];
+  if (!targets.length || !S.steps.length || S.running) return;
+  if (targets.length > 10) { toast('Máximo de 10 alvos por lote', 'warn'); return; }
+  const parseRules = id => document.getElementById(id).value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
+  const inScope = parseRules('scope-in');
+  const outScope = parseRules('scope-out');
   const loginTesting = {
     enabled: document.getElementById('login-enabled').checked,
     mode: document.getElementById('login-mode').value,
@@ -1124,9 +1199,20 @@ function startScan() {
   }
   clearTerm(); S.followups = [];
   // Build custom stages from flat step list
-  const stages = [{ id:'custom', name:'Custom', tools: S.steps.map(s=>s.tool), phase:'recon' }];
-  socket.emit('start_pipeline', {
+  const grouped = [];
+  S.steps.forEach(step => {
+    const phase = step.operationalPhase || (TOOLS[step.tool]?.phase === 'test' ? 'assessment' : 'discovery');
+    let stage = grouped.find(item => item.operational_phase === phase);
+    if (!stage) { stage = {id:`custom-${phase}`,name:PHASES[phase]?.label||'Custom',tools:[],phase:phase==='assessment'?'test':'recon',operational_phase:phase}; grouped.push(stage); }
+    stage.tools.push(step.tool);
+  });
+  const stages = grouped;
+  targets.forEach(target => {
+    const ownHost = (() => { try { return new URL(target.includes('://') ? target : `https://${target}`).hostname; } catch { return target; } })();
+    const scopePolicy = {in_scope: inScope.length ? inScope : [ownHost], out_of_scope: outScope};
+    socket.emit('start_pipeline', {
     target,
+    scope_policy: scopePolicy,
     pipeline_key: S.selectedPreset,
     custom_stages: S.selectedPreset ? null : stages,
     login_testing: loginTesting,
@@ -1137,7 +1223,12 @@ function startScan() {
       max_steps: document.getElementById('ai-steps').value,
       consent: document.getElementById('ai-consent').checked,
     } : null,
+    });
   });
+  S.running = true;
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('stop-btn').style.display = '';
+  setRunSt(`${targets.length} scans iniciadas; mostrando atividade de cada alvo`);
 }
 
 function toggleLoginOptions() {
@@ -1150,11 +1241,11 @@ function toggleLoginOptions() {
 socket.on('error', d => toast(d.message || 'Falha ao iniciar scan', 'warn'));
 
 function stopScan() {
-  if (S.scanId) socket.emit('cancel_scan', { scan_id: S.scanId });
+  for (const scanId of S.activeScanIds) socket.emit('cancel_scan', { scan_id: scanId });
 }
 
 function updateRunBtn() {
-  const t = document.getElementById('tgt').value.trim();
+  const t = document.getElementById('targets').value.trim();
   document.getElementById('run-btn').disabled = !(t && S.steps.length && !S.running);
 }
 
@@ -1163,6 +1254,7 @@ function updateRunBtn() {
 // ═══════════════════════════════════════════════════════════════════
 function showCheckpoint(data) {
   S.checkpointData = data;
+  S.checkpointScanId = data.scan_id;
   S.cpSelected = new Set(data.targets.map(t => t.value));
   document.getElementById('cp-sub').textContent =
     `${data.after_stage_name} → ${data.total} targets | próxima: ${data.next_stage}`;
@@ -1217,18 +1309,18 @@ function cpAll() {
 
 function cpApprove() {
   if (!S.cpSelected.size) { toast('Selecione pelo menos 1 target','warn'); return; }
-  const scopeRaw = (document.getElementById('scope')?.value || '').trim();
-  const scope = scopeRaw ? scopeRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const inScope = document.getElementById('scope-in').value.split(/[\n,]+/).map(s=>s.trim()).filter(Boolean);
+  const outScope = document.getElementById('scope-out').value.split(/[\n,]+/).map(s=>s.trim()).filter(Boolean);
   socket.emit('checkpoint_approve', {
-    scan_id: S.scanId,
+    scan_id: S.checkpointScanId,
     approved_targets: [...S.cpSelected],
-    scope,
+    scope_policy: {in_scope: inScope, out_of_scope: outScope},
   });
   hideCheckpoint();
 }
 
 function cpSkip() {
-  socket.emit('cancel_scan', { scan_id: S.scanId });
+  socket.emit('cancel_scan', { scan_id: S.checkpointScanId });
   hideCheckpoint();
 }
 
@@ -1486,6 +1578,49 @@ async function loadScanToUI(scanId) {
   S.lastScanId = scanId;
   await loadFindingsFromDB(scanId);
   await loadActionItems(scanId);
+  await loadOperationalLedger(scanId);
+}
+
+const LEDGER_STATUS = {
+  planned:'planejada', running:'em execução', completed:'concluída',
+  completed_with_gaps:'concluída com lacunas', pending:'pendente', blocked:'bloqueada',
+  failed:'falhou', cancelled:'cancelada', skipped:'ignorada',
+  not_applicable:'não aplicável'
+};
+
+async function loadOperationalLedger(scanId) {
+  const response = await fetch(`/api/scan/${scanId}/ledger`).catch(()=>null);
+  if (!response || !response.ok) return;
+  S.ledger = await response.json();
+  renderOperationalLedger();
+}
+
+function renderOperationalLedger() {
+  const wrap = document.getElementById('operational-ledger');
+  const data = S.ledger;
+  if (!data) return;
+  const phases = (data.coverage || []).map(item => {
+    const phase = PHASES[item.phase] || {};
+    return `<div class="ledger-card ${escH(item.status)}">
+      <div class="ledger-phase">${phase.order || '·'}. ${escH(phase.label || item.phase)}</div>
+      <div class="ledger-status">${escH(LEDGER_STATUS[item.status] || item.status)}</div>
+      <div class="ledger-reason">${escH(item.reason || item.objective)}</div>
+    </div>`;
+  }).join('');
+  const gaps = (data.tool_runs || []).filter(row => row.status !== 'completed');
+  const pending = (data.discoveries || []).filter(row => row.disposition === 'pending');
+  const gapRows = gaps.slice(0, 40).map(row => `<div class="ledger-row">
+    <span>${escH(row.tool)}</span><span class="ledger-status">${escH(LEDGER_STATUS[row.status] || row.status)}</span>
+    <span class="ledger-target">${escH(row.reason || row.target || 'Sem detalhe')}</span></div>`).join('');
+  wrap.innerHTML = `<div style="font-family:var(--sans);font-size:13px;margin-bottom:8px">Cobertura operacional</div>
+    <div style="font-size:9px;color:var(--mu2);margin-bottom:10px">Cada etapa planejada tem estado explícito. “Concluída” registra execução; não garante ausência de vulnerabilidades.</div>
+    <div class="ledger-grid">${phases}</div>
+    <div class="ledger-detail"><div style="font-size:10px;color:var(--o);margin-bottom:6px">Lacunas de execução (${gaps.length})</div>
+      ${gapRows || '<div style="font-size:9px;color:var(--g)">Nenhuma lacuna registrada.</div>'}
+      ${gaps.length > 40 ? `<div class="ledger-reason">Mais ${gaps.length - 40} registro(s) disponíveis pela API do ledger.</div>` : ''}
+    </div>
+    <div class="ledger-detail"><span style="font-size:10px">Descobertas: ${(data.discoveries || []).length}</span>
+      <span style="font-size:9px;color:${pending.length ? 'var(--o)' : 'var(--mu2)'};margin-left:8px">${pending.length} sem destino</span></div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1576,7 +1711,10 @@ function showPanel(name) {
   document.getElementById('nb-'+name).classList.add('on');
   if (name === 'results') loadResults();
   if (name === 'hosts') loadHosts();
-  if (name === 'coverage') { renderChecklist(); renderFollowups(); }
+  if (name === 'coverage') {
+    renderChecklist(); renderFollowups();
+    if (S.lastScanId) loadOperationalLedger(S.lastScanId);
+  }
   if (name === 'findings') {
     if (!S.findings.length && S.lastScanId) loadFindingsFromDB(S.lastScanId);
     else { renderFindBar(); renderFindings(); }
@@ -1691,7 +1829,7 @@ const initialSelection = new URLSearchParams(window.location.search);
 const suggestedPipeline = initialSelection.get('pipeline');
 const suggestedTarget = initialSelection.get('target');
 if (suggestedTarget && suggestedPipeline && PIPELINES[suggestedPipeline]?.profile_segmented) {
-  document.getElementById('tgt').value = suggestedTarget;
+  document.getElementById('targets').value = suggestedTarget;
   selectPreset(suggestedPipeline);
   toast('Alvo e pipeline preparados; revise o escopo antes de iniciar', 'ok');
 }

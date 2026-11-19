@@ -14,7 +14,7 @@
 preserva o escopo, seleciona testes compatíveis, correlaciona evidências e gera relatórios.
 
 [Instalação](#instalação) · [Recursos](#o-que-o-reconx-faz) · [Arquitetura](#arquitetura) ·
-[Pipelines](#pipelines) · [Documentação](#documentação)
+[Pipelines](#pipelines) · [Fluxo operacional](OPERATIONAL_WORKFLOW.md) · [Documentação](#documentação)
 
 </div>
 
@@ -48,6 +48,8 @@ execução real no navegador para confirmar XSS.
 | **Proxy consistente** | Integra Burp Suite, OWASP ZAP, Tor ou proxy customizado, bloqueando fallback direto silencioso. |
 | **Triagem por IA** | Fluxo opcional com catálogo fechado, contexto sanitizado e aprovação explícita por ação. |
 | **Relatórios** | Exporta Markdown e HTML com cobertura, achados, evidências e mapa de engenharia reversa. |
+| **Guia WSTG offline** | Prioriza endpoints com heurísticas WSTG e gera hipóteses para revisão manual. |
+| **Ledger por estágio** | Mostra pivôs extraídos separadamente dos novos achados; a fila de validação exclui sinais `info`. |
 
 ## Arquitetura
 
@@ -59,12 +61,14 @@ flowchart LR
     G --> T[Catálogo de ferramentas]
     T --> R[Resultados brutos]
     R --> C[Parsers + correlação]
-    C --> F[(SQLite<br/>scans, assets, findings)]
+    C --> F[(SQLite<br/>scans, assets, findings, ledger)]
     C --> A[Adaptive Web]
     A --> M[Mapa da aplicação]
     F --> H[Perfis por host]
     F --> E[Relatórios MD / HTML]
     M --> E
+    F --> W[Triagem offline WSTG]
+    W --> G[analysis_guide.md]
 ```
 
 ### Fluxo de confiança
@@ -77,6 +81,44 @@ output bruto → candidato → correlação/deduplicação → validação compo
 - Redirects e pivôs para outra origem não ampliam autorização.
 - Tool ausente, timeout, 404 ou parâmetro inexistente são estados de cobertura, não vulnerabilidades.
 - Evidências brutas ficam separadas dos relatórios preparados.
+
+### Método, perfis e retomada
+
+O fluxo combina planejamento e autorização inspirados no PTES, descoberta e testes
+orientados pela OWASP WSTG e o ciclo Map → Analyze → Exploit. Exploit representa
+validação autorizada de hipóteses e não implica ações destrutivas automáticas.
+
+O SQLite mantém estados de ativos (`discovered`, `probed`, `enumerated`, `triaged`)
+e histórico de execução por ferramenta. A camada `core` oferece exportação JSONL/TXT,
+classificação offline WSTG e geração de guia de análise manual.
+
+Perfis do servidor:
+
+| Perfil | Comportamento |
+|---|---|
+| `passive` | Usa ferramentas marcadas como passivas/rápidas e reduz timeouts. |
+| `standard` | Mantém o comportamento sequencial padrão. |
+| `deep` | Amplia timeouts para ferramentas compatíveis; permanece sequencial. |
+
+```bash
+sudo reconx --profile standard --scope '*.example.com' --scope '192.0.2.0/24' \
+  --out-of-scope 'admin.example.com'
+sudo reconx --profile passive
+sudo reconx --resume SCAN_ID
+sudo reconx --analyze SCAN_ID
+sudo reconx --export-jsonl SCAN_ID
+sudo reconx --export-txt SCAN_ID
+```
+
+`--scope` e `--out-of-scope` aceitam domínios, curingas e CIDRs. Exclusões têm
+precedência e as regras são verificadas antes de cada execução ferramenta–alvo.
+Na interface, a mesma política pode ser enviada em `scope_policy` com as listas
+`in_scope` e `out_of_scope`. O endpoint `GET /api/report/SCAN_ID?fmt=guide` baixa o
+guia; `GET /api/scan/SCAN_ID/analysis` retorna a priorização em JSON.
+
+`--resume` reexecuta registros de ferramenta interrompidos, fracassados ou ignorados,
+respeitando a política persistida. `--analyze` usa dados locais e grava
+`results/SCAN_ID/analysis_guide.md`, sem fazer requisições ao alvo.
 
 ## Pipelines
 
@@ -97,6 +139,10 @@ output bruto → candidato → correlação/deduplicação → validação compo
 
 Pipelines completos em perfil `full` incorporam o **Adaptive Web**. Também é possível montar um
 pipeline customizado usando as ferramentas do catálogo.
+
+O FFUF de extensões usa uma wordlist curta e uma taxa limitada para manter a enumeração previsível.
+Os presets Nuclei de CVE e misconfiguração são HTTP-only; misconfiguração não executa templates de
+login padrão. Resultados automatizados continuam candidatos até a triagem humana.
 
 ## Engenharia reversa de aplicações web
 
@@ -179,11 +225,16 @@ sudo reconx --expose
 
 ### Primeiro scan
 
-1. Registre a autorização e informe o alvo com protocolo, porta e caminho completos.
+1. Registre a autorização e informe um ou mais alvos (um por linha), preservando protocolo, porta e caminho completos.
 2. Escolha um pipeline e um perfil de proxy.
 3. Revise o impacto das etapas e inicie o scan.
 4. Acompanhe checkpoints, ferramentas puladas e pendências de cobertura.
 5. Valide candidatos antes de reportar e exporte o relatório do scan.
+
+Cada linha inicia um scan separado; até três pipelines executam ao mesmo tempo.
+Na seção **Alvos e escopo**, informe regras comuns de inclusão e exclusão. Sem
+regras de inclusão, cada scan começa limitado ao domínio/IP do alvo daquela linha.
+As exclusões se aplicam a todos os scans do lote.
 
 Exemplo de alvo com caminho preservado:
 

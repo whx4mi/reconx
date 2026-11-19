@@ -227,6 +227,20 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(pages), 2)
         self.assertEqual(errors, [])
 
+    def test_crawler_ignores_bare_host_seeds_instead_of_turning_them_into_paths(self):
+        fetched = []
+        def fetch(url):
+            fetched.append(url)
+            return self.response('<main>ok</main>')
+
+        pages, errors, _ = discover(
+            'http://sispatio.com.br', fetch,
+            seeds=['sispatio.com.br', 'http://sispatio.com.br/login.php'])
+        self.assertEqual(fetched, ['http://sispatio.com.br/',
+                                   'http://sispatio.com.br/login.php'])
+        self.assertEqual([page.url for page in pages], fetched)
+        self.assertEqual(errors, [])
+
     def test_crawler_does_not_fetch_same_origin_links_outside_application_base(self):
         fetched = []
         def fetch(url):
@@ -347,7 +361,13 @@ class WebIntelligenceTests(unittest.TestCase):
         function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_pipeline')
         exec(compile(ast.Module(body=[function], type_ignores=[]), 'app.py', 'exec'), ns)
         run_stage = MagicMock(return_value=({}, []))
-        ns.update(run_stage=run_stage, _finish=MagicMock())
+        ns.update(
+            run_stage=run_stage, _finish=MagicMock(),
+            operational_phase_for_stage=lambda stage, index:
+                'assessment' if stage.get('phase') == 'test' else ('recon' if index == 0 else 'discovery'),
+            db_operational_ledger=MagicMock(return_value={'discoveries': []}),
+            db_dispose_discoveries=MagicMock(), db_update_coverage=MagicMock(),
+        )
         pipeline = {'label': 'Web App Pentest', 'stages': [
             {'id': 'recon', 'phase': 'recon', 'tools': []},
             {'id': 'test', 'phase': 'test', 'tools': []}]}
@@ -380,6 +400,7 @@ class WebIntelligenceTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('--url') + 1], BASE + '?q=x')
         self.assertIn('--cookies', cmd)
         self.assertNotIn('--cookie', cmd)
+        self.assertEqual(cmd[cmd.index('--timeout') + 1], '20')
 
     def test_positive_finding_after_120_operational_lines_is_retained(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))

@@ -11,11 +11,55 @@ import app as reconx
 
 
 class PipelineResilienceTests(unittest.TestCase):
+    def test_operator_phase_model_separates_recon_discovery_and_assessment(self):
+        prepared = reconx.pipelines_for_ui()['full_pentest']['stages']
+        self.assertEqual(prepared[0]['operational_phase'], 'recon')
+        self.assertEqual(prepared[1]['operational_phase'], 'discovery')
+        self.assertEqual(prepared[-1]['operational_phase'], 'assessment')
+        self.assertEqual(reconx.operational_phase_for_stage(
+            {'phase': 'recon', 'operational_phase': 'discovery'}, 0), 'discovery')
+        self.assertEqual(
+            [reconx.OPERATIONAL_PHASES[key]['order'] for key in
+             ('recon', 'discovery', 'assessment', 'validation', 'reporting')],
+            [1, 2, 3, 4, 5],
+        )
+
     def test_database_context_closes_connection(self):
         with reconx._db() as connection:
             connection.execute('SELECT 1').fetchone()
         with self.assertRaises(sqlite3.ProgrammingError):
             connection.execute('SELECT 1')
+
+    def test_stage_ledger_schema_adds_finding_count_to_existing_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'legacy.db')
+            connection = sqlite3.connect(path)
+            connection.executescript('''
+                CREATE TABLE scans (
+                    scan_id TEXT PRIMARY KEY, target TEXT, pipeline TEXT, proxy TEXT,
+                    status TEXT, started_at TEXT, finished_at TEXT,
+                    scope_json TEXT DEFAULT '{}', profile TEXT DEFAULT 'standard'
+                );
+                CREATE TABLE stage_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+                    stage_id TEXT NOT NULL, stage_name TEXT NOT NULL,
+                    operational_phase TEXT NOT NULL, status TEXT NOT NULL,
+                    input_count INTEGER DEFAULT 0, output_count INTEGER DEFAULT 0,
+                    detail TEXT, started_at TEXT, finished_at TEXT,
+                    UNIQUE(scan_id, stage_id)
+                );
+            ''')
+            connection.close()
+            original = reconx.DB_PATH
+            try:
+                reconx.DB_PATH = __import__('pathlib').Path(path)
+                reconx.db_init()
+                with reconx._db() as migrated:
+                    columns = {row['name'] for row in
+                               migrated.execute('PRAGMA table_info(stage_runs)')}
+                self.assertIn('finding_count', columns)
+            finally:
+                reconx.DB_PATH = original
 
     def test_startup_reconciles_orphaned_running_scans(self):
         orphan = f'orphan-{uuid.uuid4().hex}'
@@ -43,6 +87,114 @@ class PipelineResilienceTests(unittest.TestCase):
                     'DELETE FROM scans WHERE scan_id IN (?,?)',
                     (orphan, completed),
                 )
+
+    def test_operational_ledger_accounts_for_skipped_tool_and_discovery(self):
+        scan_id = f'ledger-{uuid.uuid4().hex}'
+        reconx.db_create_scan(scan_id, 'http://lab.test/app/', 'custom', 'none')
+        reconx.active_scans[scan_id] = {
+            'target': 'http://lab.test/app/', 'processes': {}, 'cancelled': False,
+        }
+        stage = {'id': 'inventory', 'name': 'Inventário', 'phase': 'recon',
+                 'operational_phase': 'recon', 'tools': ['tool_that_does_not_exist']}
+        try:
+            with patch.object(reconx.time, 'sleep'):
+                reconx.run_stage(scan_id, stage, ['http://lab.test/app/'], 'sid')
+            reconx.db_record_discoveries(scan_id, 'inventory', [
+                {'type': 'url', 'value': 'http://lab.test/app/admin'},
+            ])
+            reconx.db_dispose_discoveries(
+                scan_id, ['http://lab.test/app/admin'], 'consumed', 'teste')
+            ledger = reconx.db_operational_ledger(scan_id)
+            self.assertEqual(ledger['stages'][0]['status'], 'failed')
+            self.assertEqual(ledger['tool_runs'][0]['status'], 'skipped')
+            self.assertIn('não existe', ledger['tool_runs'][0]['reason'].lower())
+            self.assertEqual(ledger['discoveries'][0]['disposition'], 'consumed')
+            self.assertEqual(ledger['summary']['tools']['skipped'], 1)
+        finally:
+            reconx.active_scans.pop(scan_id, None)
+            with reconx._db_lock, reconx._db() as connection:
+                for table in ('coverage_items', 'discovery_items', 'tool_runs',
+                              'stage_runs', 'scans'):
+                    connection.execute(f'DELETE FROM {table} WHERE scan_id=?', (scan_id,))
+
+    def test_stage_ledger_separates_new_findings_from_extracted_targets(self):
+        scan_id = f'stage-findings-{uuid.uuid4().hex}'
+        reconx.db_create_scan(scan_id, 'http://lab.test/app/', 'custom', 'none',
+                              {'in_scope': ['lab.test'], 'out_of_scope': []})
+        reconx.active_scans[scan_id] = {
+            'target': 'http://lab.test/app/',
+            'scope_policy': {'in_scope': ['lab.test'], 'out_of_scope': []},
+            'processes': {}, 'cancelled': False,
+        }
+        tool_key = f'test_finding_{uuid.uuid4().hex}'
+        reconx.TOOLS[tool_key] = {
+            'label': 'Test finding', 'phase': 'test', 'input': 'url',
+            'output': 'raw', 'manual_followup': [],
+        }
+        stage = {'id': 'assessment', 'name': 'Assessment', 'phase': 'test',
+                 'operational_phase': 'assessment', 'tools': [tool_key]}
+        finding = reconx._finding(tool_key, 'vuln', 'Candidate', 'medium',
+                                  'http://lab.test/app/', 'local fixture', 'possible')
+
+        def fake_run(scan, tool, target, sid, outcome=None):
+            outcome.update(status='completed', exit_code=0, timed_out=False)
+            reconx.persist_and_emit_findings(scan, [], [finding], sid)
+            return 'raw', []
+
+        try:
+            with patch.object(reconx.time, 'sleep'), \
+                    patch.object(reconx, 'run_tool_sequential', side_effect=fake_run):
+                reconx.run_stage(scan_id, stage, ['http://lab.test/app/'], 'sid')
+            row = reconx.db_operational_ledger(scan_id)['stages'][0]
+            self.assertEqual(row['output_count'], 0)
+            self.assertEqual(row['finding_count'], 1)
+        finally:
+            reconx.TOOLS.pop(tool_key, None)
+            reconx.active_scans.pop(scan_id, None)
+            with reconx._db_lock, reconx._db() as connection:
+                for table in ('findings', 'coverage_items', 'discovery_items',
+                              'tool_runs', 'stage_runs', 'scans'):
+                    connection.execute(f'DELETE FROM {table} WHERE scan_id=?', (scan_id,))
+
+    def test_validation_queue_excludes_informational_inventory(self):
+        self.assertEqual(reconx.validation_candidate_count({'severity': {
+            'critical': 0, 'high': 0, 'medium': 1, 'low': 0,
+            'info': 10, 'unknown': 2,
+        }}), 3)
+
+    def test_web_scanner_presets_are_http_only_and_do_not_try_default_logins(self):
+        for key in ('nuclei_cves', 'nuclei_misconfig'):
+            command, _ = reconx.build_cmd(key, 'http://lab.test/app/')
+            self.assertIn('-pt', command, key)
+            self.assertEqual(command[command.index('-pt') + 1], 'http')
+        misconfig, _ = reconx.build_cmd('nuclei_misconfig', 'http://lab.test/app/')
+        self.assertEqual(misconfig[misconfig.index('-tags') + 1], 'misconfig,exposure')
+        self.assertNotIn('default-login', misconfig)
+        self.assertFalse(any('brute force' in tip.lower() or
+                             'credential stuffing' in tip.lower()
+                             for tip in reconx.TOOLS['nuclei_misconfig']['manual_followup']))
+
+    def test_ffuf_extension_scan_uses_a_bounded_curated_wordlist(self):
+        command, _ = reconx.build_cmd('ffuf_ext', 'http://lab.test/app/')
+        wordlist = command[command.index('-w') + 1]
+        with open(wordlist, encoding='utf-8') as stream:
+            words = [line.strip() for line in stream if line.strip() and not line.startswith('#')]
+        extensions = command[command.index('-e') + 1].split(',')
+        self.assertLessEqual(len(words) * len(extensions), 1000)
+        self.assertEqual(command[command.index('-rate') + 1], '5')
+
+    def test_ledger_api_returns_all_five_operator_phases(self):
+        scan_id = f'ledger-api-{uuid.uuid4().hex}'
+        reconx.db_create_scan(scan_id, 'http://lab.test/app/', 'custom', 'none')
+        try:
+            response = reconx.app.test_client().get(f'/api/scan/{scan_id}/ledger')
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual([item['phase'] for item in response.get_json()['coverage']],
+                             ['recon', 'discovery', 'assessment', 'validation', 'reporting'])
+        finally:
+            with reconx._db_lock, reconx._db() as connection:
+                connection.execute('DELETE FROM coverage_items WHERE scan_id=?', (scan_id,))
+                connection.execute('DELETE FROM scans WHERE scan_id=?', (scan_id,))
 
     def test_runtime_temp_directory_lives_beside_results(self):
         self.assertEqual(reconx.RUNTIME_TMP_DIR, reconx.RESULTS_DIR / '.tmp')
@@ -148,6 +300,9 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertIn('http://lab.test/app/', cmd)
         ffuf, _ = reconx.build_cmd('ffuf_dirs', 'http://lab.test/app/')
         self.assertIn('http://lab.test/app/FUZZ', ffuf)
+        self.assertEqual(ffuf[ffuf.index('-rate') + 1], '5')
+        self.assertEqual(ffuf[ffuf.index('-t') + 1], '5')
+        self.assertNotIn('-recursion', ffuf)
 
     def test_uncover_uses_precise_shodan_query_and_parses_plain_or_json_hosts(self):
         command, effective = reconx.build_cmd('uncover', 'https://example.test/app/')
@@ -237,6 +392,13 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertEqual(reconx.targets_for_tool('nuclei_dast', targets), [targets[3]])
         self.assertNotIn(targets[2], reconx.targets_for_tool('nuclei_cves', targets))
 
+    def test_dalfox_only_receives_parameterized_urls(self):
+        targets = ['http://lab.test/', 'http://lab.test/fra.php?',
+                   'http://lab.test/search.php?q=term', 'http://lab.test/view.php?id=']
+        expected = ['http://lab.test/search.php?q=term', 'http://lab.test/view.php?id=']
+        self.assertEqual(reconx.targets_for_tool('dalfox', targets), expected)
+        self.assertEqual(reconx.targets_for_tool('dalfox_url', targets), expected)
+
     def test_commix_operational_critical_is_not_a_finding(self):
         raw = "[critical] No parameter(s) found for testing in the provided data"
         _, findings = reconx.parse_output('commix', raw, 'http://lab.test/app/')
@@ -264,6 +426,12 @@ class PipelineResilienceTests(unittest.TestCase):
         self.assertEqual(len(commix_finding), 1)
         self.assertEqual(sqlmap_finding[0]['confidence'], 'likely')
         self.assertEqual(commix_finding[0]['confidence'], 'likely')
+
+    def test_sqlmap_no_forms_is_a_coverage_gap_not_an_execution_failure(self):
+        raw = '[CRITICAL] there were no forms found at the given target URL'
+        issue = reconx.tool_output_quality_issue('sqlmap', raw)
+        self.assertIn('sem encontrar formulários', issue)
+        self.assertEqual(reconx.parse_output('sqlmap', raw, 'http://lab.test/'), ([], []))
 
     def test_root_cause_dedup_preserves_strongest_severity_and_confidence(self):
         scan_id = f'dedup-{uuid.uuid4().hex}'
@@ -322,6 +490,41 @@ Nmap done: 1 IP address (1 host up) scanned in 7.19 seconds'''
         _, findings = reconx.parse_output('nmap_quick', raw, '192.0.2.10')
         self.assertEqual([f['name'] for f in findings],
                          ['80/tcp open  http    Apache httpd 2.4.66'])
+
+    def test_nmap_permission_and_host_down_output_is_not_trusted(self):
+        for raw in (
+            "socket: Operation not permitted (1)\nHost seems down.",
+            "You requested a scan type which requires root privileges.",
+        ):
+            self.assertTrue(reconx.tool_output_quality_issue('nmap_quick', raw))
+            self.assertEqual(reconx.parse_output('nmap_quick', raw, '192.0.2.10'),
+                             ([], []))
+
+    def test_ffuf_silent_paths_are_normalized_and_recovered(self):
+        raw = 'app\ncgi-bin/\n.env\nbackup.zip\n../outside\n'
+        assets, findings = reconx.parse_output(
+            'ffuf_dirs', raw, 'http://lab.test/')
+        self.assertEqual([item['value'] for item in assets],
+                         ['/app', '/cgi-bin/', '/.env', '/backup.zip'])
+        self.assertEqual(len(findings), 4)
+
+    def test_naabu_rejects_duplicate_or_mass_port_results(self):
+        duplicate = '{"ip":"192.0.2.10","port":443}\n' * 20
+        issue = reconx.tool_output_quality_issue('naabu', duplicate)
+        self.assertIn('duplicados', issue)
+
+        mass_result = '\n'.join(
+            __import__('json').dumps({'ip': '192.0.2.10', 'port': port})
+            for port in range(1, 102)
+        )
+        mass_issue = reconx.tool_output_quality_issue('naabu', mass_result)
+        self.assertIn('101 portas únicas', mass_issue)
+        self.assertEqual(reconx.parse_output('naabu', mass_result, '192.0.2.10'),
+                         ([], []))
+
+        small_duplicate = '{"ip":"192.0.2.10","port":443}\n' * 2
+        _, findings = reconx.parse_output('naabu', small_duplicate, '192.0.2.10')
+        self.assertEqual(len(findings), 1)
 
     def test_nuclei_technology_info_becomes_asset_not_finding(self):
         record = {
